@@ -15,7 +15,7 @@ jobs:
       contents: read
 
     env:
-      ORG_NAME: devops-saddam             # ✅ replace or set via org/environment variable
+      ORG_NAME: devops-saddam
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -30,6 +30,7 @@ jobs:
 
       - name: Run Branch Protection Audit
         run: |
+          python - <<'EOF'
           import os, requests, json
 
           ORG = os.getenv("ORG_NAME")
@@ -99,7 +100,6 @@ jobs:
 
               missing = []
               reqs = protection.get("required_pull_request_reviews")
-              allow_bypass = protection.get("allow_force_pushes", {}).get("enabled", False)
 
               if not reqs:
                   missing.append("Require pull request before merging not enabled")
@@ -132,3 +132,4 @@ jobs:
               msg = ["✅ All repositories are compliant."]
 
           requests.post(SLACK_WEBHOOK, json={"text": "\n".join(msg)})
+          EOF
