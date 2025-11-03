@@ -15,7 +15,7 @@ jobs:
 
     env:
       ORG_NAME: ${{ github.repository_owner }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}
       SLACK_WEBHOOK: ${{ secrets.EDEVOPS_SLACK_WEBHOOK_URL }}
       DEBUG: "true"
       PYTHONUNBUFFERED: "1"
