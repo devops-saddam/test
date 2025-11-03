@@ -94,7 +94,7 @@ jobs:
               rules = get_rules(name, default_branch)
               
               if not rules:
-                  # Fallback: try classic protection endpoint
+                  # Rules API returned empty - try classic protection endpoint as fallback
                   classic = try_get_classic_protection(name, default_branch)
                   if classic:
                       issues = []
@@ -117,11 +117,12 @@ jobs:
                           log(f"{name}: ✅ All required rules in place (classic branch protection)")
                           ok.append(name)
                       continue
-                  # No protection found on default branch using Rules API and classic fallback
-                  log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
+                  # No protection found - Rules API returned empty and classic endpoint not accessible (403)
+                  # Note: Classic branch protection may exist but Rules API doesn't always expose it
+                  log(f"{name}: ❌ No branch protection rule or ruleset found via Rules API on default branch '{default_branch}' (classic protection endpoint returned 403)")
                   missing.append({
                       "repo": name,
-                      "issues": [f"No branch protection rule or ruleset configured on default branch '{default_branch}'"],
+                      "issues": [f"No branch protection rule or ruleset found on default branch '{default_branch}'. Note: Classic branch protection may exist but API access is limited."],
                       "source": "no protection"
                   })
                   continue
@@ -136,14 +137,19 @@ jobs:
               for rule in rules:
                   rule_type = rule.get("type")
                   rule_source_val = rule.get("source")
-                  dbg(f"Rule: type={rule_type}, source={rule_source_val}")
+                  ruleset_source_type = rule.get("ruleset_source_type")
+                  ruleset_source = rule.get("ruleset_source")
+                  dbg(f"Rule: type={rule_type}, source={rule_source_val}, ruleset_source_type={ruleset_source_type}")
                   
+                  # Check for classic branch protection
                   if rule_source_val == "BranchProtectionRule":
                       rule_source = "classic"
                       break
-                  elif rule_source_val == "RepositoryRuleSet":
+                  # Check for ruleset (two possible formats)
+                  elif rule_source_val == "RepositoryRuleSet" or ruleset_source_type == "Repository":
                       rule_source = "ruleset"
-                      ruleset_name = rule.get("ruleset_name") or rule.get("name", "unknown")
+                      # Try multiple ways to get ruleset name
+                      ruleset_name = rule.get("ruleset_name") or rule.get("name") or ruleset_source or "unknown"
                       break
 
               if not rule_source:
