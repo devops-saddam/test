@@ -71,7 +71,6 @@ jobs:
               repo_name = repo["name"]
               default_branch = repo["default_branch"]
 
-              # Get all branches
               branches_resp = requests.get(
                   f"https://api.github.com/repos/{ORG}/{repo_name}/branches",
                   headers=headers
@@ -80,7 +79,7 @@ jobs:
 
               protection = get_branch_protection(repo_name, default_branch)
 
-              # Check for mismatched protection rules
+              # Check for mismatched branch protection
               for br in branches:
                   if br["name"] != default_branch:
                       other_protection = get_branch_protection(repo_name, br["name"])
@@ -91,10 +90,11 @@ jobs:
                               "protected": br["name"]
                           })
 
+              # Validate protection on default branch
               if not protection:
                   missing_configs.append({
                       "repo": repo_name,
-                      "missing": ["Branch protection rule not found"]
+                      "missing": ["Branch protection rule not found on default branch"]
                   })
                   continue
 
@@ -104,10 +104,10 @@ jobs:
               if not reqs:
                   missing.append("Require pull request before merging not enabled")
               elif reqs.get("required_approving_review_count", 0) < 2:
-                  missing.append("Required approving reviews < 2")
+                  missing.append(f"Required approving reviews is {reqs.get('required_approving_review_count', 0)} (expected 2)")
 
               if protection.get("allow_force_pushes", {}).get("enabled"):
-                  missing.append("Force pushes allowed")
+                  missing.append("Force pushes are allowed")
 
               if protection.get("enforce_admins", {}).get("enabled") == False:
                   missing.append("Admins can bypass protection")
@@ -118,18 +118,46 @@ jobs:
                       "missing": missing
                   })
 
-          msg = []
+          # --- Build Slack message payload ---
+          blocks = []
+
           if missing_configs:
-              msg.append("*❌ Missing or Incorrect Configurations:*")
+              blocks.append({
+                  "type": "header",
+                  "text": {"type": "plain_text", "text": "❌ Missing / Misconfigured Branch Protections"}
+              })
               for m in missing_configs:
-                  msg.append(f"• `{m['repo']}` — {', '.join(m['missing'])}")
+                  detail_text = "\n".join([f"• {i}" for i in m["missing"]])
+                  blocks.append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Repository:* `{m['repo']}`\n{detail_text}"
+                      }
+                  })
+                  blocks.append({"type": "divider"})
+
           if mismatched:
-              msg.append("\n*⚠️ Mismatched Branch Protections:*")
+              blocks.append({
+                  "type": "header",
+                  "text": {"type": "plain_text", "text": "⚠️ Mismatched Branch Protections"}
+              })
               for mm in mismatched:
-                  msg.append(f"• `{mm['repo']}` — Protected `{mm['protected']}` but default is `{mm['default']}`")
+                  blocks.append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Repository:* `{mm['repo']}`\nProtection applied to `{mm['protected']}` but default branch is `{mm['default']}`"
+                      }
+                  })
+                  blocks.append({"type": "divider"})
 
-          if not msg:
-              msg = ["✅ All repositories are compliant."]
+          if not blocks:
+              blocks = [{
+                  "type": "section",
+                  "text": {"type": "mrkdwn", "text": "✅ All repositories are fully compliant."}
+              }]
 
-          requests.post(SLACK_WEBHOOK, json={"text": "\n".join(msg)})
+          payload = {"blocks": blocks}
+          requests.post(SLACK_WEBHOOK, json=payload)
           EOF
