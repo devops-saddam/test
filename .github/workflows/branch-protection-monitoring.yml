@@ -117,12 +117,34 @@ jobs:
                           log(f"{name}: ✅ All required rules in place (classic branch protection)")
                           ok.append(name)
                       continue
-                  # No protection found - Rules API returned empty and classic endpoint not accessible (403)
-                  # Note: Classic branch protection may exist but Rules API doesn't always expose it
-                  log(f"{name}: ❌ No branch protection rule or ruleset found via Rules API on default branch '{default_branch}' (classic protection endpoint returned 403)")
+                  
+                  # Workaround: If classic endpoint returned 403, check common branch names for mismatch
+                  # Check master, develop, dev branches to detect misconfigured protection
+                  common_branches = ["master", "develop", "dev"]
+                  protected_branches = []
+                  
+                  for branch in common_branches:
+                      if branch != default_branch:
+                          classic_check = try_get_classic_protection(name, branch)
+                          if classic_check:
+                              protected_branches.append(branch)
+                  
+                  if protected_branches:
+                      # Found classic protection on a different branch
+                      branches_str = ", ".join(protected_branches)
+                      log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {branches_str}")
+                      missing.append({
+                          "repo": name,
+                          "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {branches_str}"],
+                          "source": "mismatch"
+                      })
+                      continue
+                  
+                  # No protection found anywhere
+                  log(f"{name}: ❌ No branch protection rule or ruleset found on default branch '{default_branch}'. Note: Classic branch protection may exist please check manually")
                   missing.append({
                       "repo": name,
-                      "issues": [f"No branch protection rule or ruleset found on default branch '{default_branch}'. Note: Classic branch protection may exist but API access is limited."],
+                      "issues": [f"No branch protection rule or ruleset found on default branch '{default_branch}'. Note: Classic branch protection may exist please check manually"],
                       "source": "no protection"
                   })
                   continue
