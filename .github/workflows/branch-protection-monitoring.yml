@@ -98,17 +98,59 @@ jobs:
               rule_source = None
               ruleset_name = None
               
+              # Debug: log what rules we received
+              dbg(f"Rules found on {default_branch}: {rules}")
+              
               for rule in rules:
-                  if rule.get("source") == "BranchProtectionRule":
+                  rule_type = rule.get("type")
+                  rule_source_val = rule.get("source")
+                  dbg(f"Rule: type={rule_type}, source={rule_source_val}")
+                  
+                  if rule_source_val == "BranchProtectionRule":
                       rule_source = "classic"
                       break
-                  elif rule.get("source") == "RepositoryRuleSet":
+                  elif rule_source_val == "RepositoryRuleSet":
                       rule_source = "ruleset"
                       ruleset_name = rule.get("ruleset_name") or rule.get("name", "unknown")
                       break
 
               if not rule_source:
-                  rule_source = "unknown"
+                  # Rules found but we can't identify the source - provide diagnostic info
+                  sources_found = [r.get("source") for r in rules if r.get("source")]
+                  types_found = [r.get("type") for r in rules if r.get("type")]
+                  log(f"{name}: ⚠️ Branch protection rules found but source type not recognized. Sources: {sources_found}, Types: {types_found}")
+                  
+                  # Still try to validate what we can
+                  rule_types = {r.get("type"): r for r in rules}
+                  
+                  # Check for common rule types regardless of source
+                  if "pull_request" not in rule_types:
+                      issues.append("Require pull request before merging not enabled")
+                  
+                  if "required_approving_review_count" not in rule_types:
+                      issues.append("Required approving reviews rule missing")
+                  else:
+                      params = rule_types["required_approving_review_count"].get("parameters") or {}
+                      count = params.get("required_approving_review_count") or params.get("count")
+                      if not count:
+                          issues.append("Approvals rule present but count missing")
+                      elif int(count) != 2:
+                          issues.append(f"Required approvals = {count}, expected 2")
+                  
+                  if "dismiss_stale_reviews" not in rule_types:
+                      issues.append("Dismiss stale pull request approvals when new commits are pushed not enabled")
+                  
+                  if issues:
+                      log(f"{name}: ❌ Issues found in unrecognized branch protection configuration → {', '.join(issues)}")
+                      missing.append({"repo": name, "issues": issues, "source": f"unrecognized (sources: {', '.join(sources_found or ['none'])})"})
+                  else:
+                      log(f"{name}: ✅ Rules found but source type not recognized. Types: {', '.join(types_found or ['none'])}")
+                      missing.append({
+                          "repo": name,
+                          "issues": [f"Branch protection rules found but configuration type not recognized. Rule types found: {', '.join(types_found or ['none'])}"],
+                          "source": "unrecognized"
+                      })
+                  continue
 
               if rule_source == "classic":
                   log(f"{name}: Found classic branch protection rule on '{default_branch}'")
@@ -174,13 +216,6 @@ jobs:
                   else:
                       log(f"{name}: ✅ All required rules in place (ruleset '{ruleset_name}')")
                       ok.append(name)
-              else:
-                  log(f"{name}: ❌ Unknown or invalid branch protection configuration")
-                  missing.append({
-                      "repo": name,
-                      "issues": ["Unknown or invalid branch protection configuration"],
-                      "source": "unknown"
-                  })
 
           # ---- Slack reporting with chunking to avoid payload limits
           if SLACK:
