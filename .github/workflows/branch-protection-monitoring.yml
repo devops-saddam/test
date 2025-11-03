@@ -10,8 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      metadata: read
-      administration: read
 
     env:
       ORG_NAME: devops-saddam             # ✅ replace or set via org/environment variable
