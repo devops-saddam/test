@@ -5,7 +5,7 @@ on:
   push:                   # ✅ Trigger on any push to test behavior
     branches:
       - main               # or your preferred branch
-  
+
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -38,9 +38,8 @@ jobs:
           SLACK = os.getenv("SLACK_WEBHOOK")
           DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-          def log(msg, lvl="INFO"):
-              print(f"[{lvl}] {msg}", flush=True)
-          def dbg(msg):
+          def log(msg, lvl="INFO"): print(f"[{lvl}] {msg}", flush=True)
+          def dbg(msg): 
               if DEBUG: log(msg, "DEBUG")
 
           headers = {
@@ -70,9 +69,13 @@ jobs:
                   page += 1
               return repos
 
-          def get_rules(repo, branch):
+          def get_branch_rules(repo, branch):
               url = f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}"
               return get_json(url)
+
+          def get_rulesets(repo):
+              url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
+              return get_json(url) or []
 
           # --- Start ---
           repos = get_repos()
@@ -83,12 +86,18 @@ jobs:
 
           for idx, repo in enumerate(repos, start=1):
               name = repo["name"]
-              branch = repo["default_branch"]
+              default_branch = repo["default_branch"]
               log(f"\n[{idx}/{len(repos)}] Checking repository: {name}")
-              log(f"Default branch for {name} is '{branch}'")
+              log(f"Default branch for {name} is '{default_branch}'")
 
-              rules = get_rules(name, branch)
-              if not rules:
+              # 1️⃣  Get branch-specific rules
+              branch_rules = get_branch_rules(name, default_branch)
+              # 2️⃣  Also fetch all rulesets for mismatch detection
+              rulesets = get_rulesets(name)
+              dbg(f"Total rulesets found for {name}: {len(rulesets)}")
+
+              # --- Case: No rules found at all
+              if not branch_rules and not rulesets:
                   log(f"{name}: ❌ No branch protection rule or ruleset configured")
                   missing.append({
                       "repo": name,
@@ -97,11 +106,36 @@ jobs:
                   })
                   continue
 
-              dbg(f"Raw rule count: {len(rules)}")
-              for r in rules:
-                  dbg(f"  Rule type={r.get('type')} parameters={r.get('parameters')}")
+              # --- Detect branch protection mismatch
+              branch_patterns = []
+              for rs in rulesets:
+                  cond = rs.get("conditions", {})
+                  ref_name = cond.get("ref_name", {})
+                  includes = ref_name.get("include") or []
+                  for pattern in includes:
+                      branch_patterns.append(pattern)
 
-              # Detect protection source type
+              dbg(f"Branch patterns detected: {branch_patterns}")
+              if branch_patterns and all(default_branch not in pat for pat in branch_patterns):
+                  log(f"{name}: ⚠️ Mismatch — protection applies to {branch_patterns} but default branch is '{default_branch}'")
+                  missing.append({
+                      "repo": name,
+                      "issues": [f"Misconfigured branch protection: Default branch is '{default_branch}' but protection applies to {', '.join(branch_patterns)}"],
+                      "source": "mismatch"
+                  })
+                  continue
+
+              # --- Evaluate actual rules for default branch
+              rules = branch_rules or []
+              if not rules:
+                  log(f"{name}: ❌ No branch protection rules found for default branch '{default_branch}'")
+                  missing.append({
+                      "repo": name,
+                      "issues": [f"No branch protection rules found for default branch '{default_branch}'"],
+                      "source": "no protection"
+                  })
+                  continue
+
               rule_source = "classic"
               if any(r.get("source") == "RepositoryRuleset" for r in rules):
                   rule_source = "ruleset"
@@ -112,11 +146,8 @@ jobs:
               rule_types = {r.get("type"): r for r in rules}
               issues = []
 
-              # 1. Require PR before merge
               if "pull_request" not in rule_types:
                   issues.append("Require pull request before merging not enabled")
-
-              # 2. Required approvals count
               if "required_approving_review_count" not in rule_types:
                   issues.append("Required approving reviews rule missing")
               else:
@@ -126,16 +157,10 @@ jobs:
                       issues.append("Approvals rule present but count missing")
                   elif int(count) < 2:
                       issues.append(f"Approvals required = {count}, expected 2")
-
-              # 3. Dismiss stale reviews
               if "dismiss_stale_reviews" not in rule_types:
                   issues.append("Dismiss stale pull request approvals not enabled")
-
-              # 4. Restrict deletions
               if "restrict_deletions" not in rule_types:
                   issues.append("Restrict deletions rule not enabled")
-
-              # 5. Block force pushes
               if "non_fast_forward" not in rule_types:
                   issues.append("Block force pushes rule not enabled")
 
@@ -146,17 +171,6 @@ jobs:
                   log(f"{name}: ✅ All required rules in place ({rule_source})")
                   ok.append(name)
 
-          # --- Summary ---
-          log("\n========= AUDIT SUMMARY =========")
-          log(f"Total repositories: {len(repos)}")
-          log(f"Compliant: {len(ok)}")
-          log(f"Issues: {len(missing)}")
-          if missing:
-              log("\nRepositories with issues:")
-              for m in missing:
-                  log(f"- {m['repo']} ({m['source']}): {', '.join(m['issues'])}")
-          log("=================================")
-
           # --- Slack Notification ---
           if SLACK:
               summary = (
@@ -165,10 +179,7 @@ jobs:
                   f"✅ Compliant: {len(ok)}\n"
                   f"❌ With Issues: {len(missing)}"
               )
-
-              blocks = [
-                  {"type": "section", "text": {"type": "mrkdwn", "text": summary}}
-              ]
+              blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}]
 
               if missing:
                   blocks.append({"type": "divider"})
@@ -181,6 +192,8 @@ jobs:
                       source = m.get("source", "unknown protection")
                       if source == "no protection":
                           heading = f"*{repo_name}*\nNo branch protection rule or ruleset configured"
+                      elif source == "mismatch":
+                          heading = f"*{repo_name}*\nMisconfigured branch protection found"
                       elif "ruleset" in source:
                           heading = f"*{repo_name}*\nFound {source} applied"
                       elif source == "classic":
@@ -207,5 +220,4 @@ jobs:
                   log(f"Slack POST failed: {e}", "WARN")
           else:
               log("No SLACK_WEBHOOK set, skipping Slack notification.", "WARN")
-
           EOF
