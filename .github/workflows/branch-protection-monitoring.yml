@@ -16,7 +16,7 @@ jobs:
     env:
       ORG_NAME: ${{ github.repository_owner }}
       GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SLACK_WEBHOOK: ${{ secrets.EDEVOPS_SLACK_WEBHOOK_URL }}
       DEBUG: "true"
       PYTHONUNBUFFERED: "1"
 
@@ -66,6 +66,15 @@ jobs:
           def get_rules(repo, branch):
               return get_json(f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}") or []
 
+          def try_get_classic_protection(repo, branch):
+              # Best-effort classic protection fetch; may return 403 if PAT lacks scope
+              url = f"https://api.github.com/repos/{ORG}/{repo}/branches/{branch}/protection"
+              r = requests.get(url, headers=H, timeout=30)
+              dbg(f"GET {url} -> {r.status_code}")
+              if r.status_code == 200:
+                  return r.json()
+              return None
+
           # ---- Start
           repos = list_repos()
           log(f"Total repositories found: {len(repos)}")
@@ -85,7 +94,30 @@ jobs:
               rules = get_rules(name, default_branch)
               
               if not rules:
-                  # No protection found on default branch using Rules API
+                  # Fallback: try classic protection endpoint
+                  classic = try_get_classic_protection(name, default_branch)
+                  if classic:
+                      issues = []
+                      pr_reviews = classic.get("required_pull_request_reviews")
+                      if not pr_reviews:
+                          issues.append("Require pull request before merging not enabled")
+                      else:
+                          cnt = pr_reviews.get("required_approving_review_count", 0)
+                          if int(cnt) != 2:
+                              issues.append(f"Required approvals = {cnt}, expected 2")
+                          if not pr_reviews.get("dismiss_stale_reviews", False):
+                              issues.append("Dismiss stale pull request approvals when new commits are pushed not enabled")
+                      if not classic.get("required_status_checks"):
+                          issues.append("Require status checks to pass before merging not enabled")
+
+                      if issues:
+                          log(f"{name}: ❌ Issues (classic branch protection) → {', '.join(issues)}")
+                          missing.append({"repo": name, "issues": issues, "source": "classic"})
+                      else:
+                          log(f"{name}: ✅ All required rules in place (classic branch protection)")
+                          ok.append(name)
+                      continue
+                  # No protection found on default branch using Rules API and classic fallback
                   log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
                   missing.append({
                       "repo": name,
@@ -227,8 +259,8 @@ jobs:
                           "text": (
                               f"*Branch Protection Audit Summary*\n"
                               f"Total repositories: {len(repos)}\n"
-                              f"✅ Compliant: {len(ok)}\n"
-                              f"❌ With Issues: {len(missing)}"
+                              f"Compliant: {len(ok)}\n"
+                              f"With Issues: {len(missing)}"
                           )
                       }
                   }
