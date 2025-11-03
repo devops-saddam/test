@@ -1,8 +1,8 @@
 name: Branch Protection Audit
 
 on:
-  workflow_dispatch:        # Manual trigger
-  push:                     # Optional: for testing
+  workflow_dispatch:
+  push:
     branches:
       - main
 
@@ -15,7 +15,11 @@ jobs:
     env:
       ORG_NAME: devops-saddam
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-      GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}   # <-- Use your new PAT with ruleset read access
+      # Use your Fine-grained PAT with repo admin/rules read permissions:
+      GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}
+      # Verbose logging (set to "false" later if you want quieter runs)
+      DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Setup Python
@@ -26,150 +30,181 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Branch Protection + Ruleset Audit
+      - name: Run Branch Protection Audit (with detailed logging)
         run: |
           python - <<'EOF'
-          import os, requests, json
+          import os, sys, time, json, math
+          import requests
 
           ORG = os.getenv("ORG_NAME")
           GH_TOKEN = os.getenv("GITHUB_TOKEN")
           SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
+          DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+          def log(msg="", *, prefix="[INFO]"):
+              print(f"{prefix} {msg}", flush=True)
+
+          def dbg(msg):
+              if DEBUG:
+                  log(msg, prefix="[DEBUG]")
+
+          if not ORG or not GH_TOKEN:
+              log("Missing ORG_NAME or GITHUB_TOKEN. Exiting.", prefix="[ERROR]")
+              sys.exit(1)
 
           headers = {
               "Authorization": f"Bearer {GH_TOKEN}",
               "Accept": "application/vnd.github+json"
           }
 
-          def get_repos():
-              repos = []
-              page = 1
+          def rate_limit_wait(resp):
+              # Basic backoff if near/at the rate limit
+              remaining = resp.headers.get("X-RateLimit-Remaining")
+              reset = resp.headers.get("X-RateLimit-Reset")
+              limit  = resp.headers.get("X-RateLimit-Limit")
+              if remaining is not None and reset is not None:
+                  try:
+                      remaining = int(remaining)
+                      reset = int(reset)
+                      now = int(time.time())
+                      if remaining <= 1 and reset > now:
+                          wait_s = max(0, reset - now) + 1
+                          log(f"Rate limit reached (limit={limit}, remaining={remaining}). Sleeping {wait_s}s until reset…")
+                          time.sleep(wait_s)
+                  except Exception:
+                      pass
+
+          def get_json(url, *, params=None, name=""):
+              dbg(f"GET {url} params={params}")
+              r = requests.get(url, headers=headers, params=params, timeout=30)
+              rate_limit_wait(r)
+              dbg(f"→ HTTP {r.status_code} for {name or url}")
+              if DEBUG:
+                  dbg(f"  RateLimit: limit={r.headers.get('X-RateLimit-Limit')} remaining={r.headers.get('X-RateLimit-Remaining')} reset={r.headers.get('X-RateLimit-Reset')}")
+              if r.status_code == 200:
+                  return r.json()
+              elif r.status_code == 404:
+                  dbg(f"{name or url} returned 404 (not found).")
+                  return None
+              else:
+                  log(f"Unexpected {r.status_code} from {name or url}: {r.text[:500]}", prefix="[WARN]")
+                  return None
+
+          def get_all_repos(org):
+              repos, page = [], 1
               while True:
-                  resp = requests.get(
-                      f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}",
-                      headers=headers
-                  )
-                  if resp.status_code != 200:
-                      break
-                  data = resp.json()
+                  url = f"https://api.github.com/orgs/{org}/repos"
+                  data = get_json(url, params={"per_page": 100, "page": page}, name=f"List repos p{page}")
                   if not data:
                       break
+                  dbg(f"Fetched {len(data)} repos on page {page}")
                   repos.extend(data)
+                  if len(data) < 100:
+                      break
                   page += 1
+              log(f"Total repositories discovered: {len(repos)}")
               return repos
 
-          def get_branch_protection(repo, branch):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/branches/{branch}/protection"
-              resp = requests.get(url, headers=headers)
-              return resp.json() if resp.status_code == 200 else None
+          def get_effective_rules(repo, branch):
+              url = f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}"
+              return get_json(url, name=f"Effective rules for {repo}/{branch}")
 
-          def get_rulesets(repo):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
-              resp = requests.get(url, headers=headers)
-              if resp.status_code == 200:
-                  return resp.json()
-              elif resp.status_code == 403:
-                  print(f"⚠️ Access denied to rulesets for {repo}. Check token permissions.")
-              return []
+          # --- Begin ---
+          log(f"Starting Branch Protection Audit for org: {ORG}")
+          dbg("DEBUG logging enabled.")
 
-          repos = get_repos()
-          missing_configs, mismatched = [], []
+          repos = get_all_repos(ORG)
+          missing, ok = [], []
 
-          for repo in repos:
-              repo_name = repo["name"]
-              default_branch = repo["default_branch"]
+          for idx, repo in enumerate(repos, start=1):
+              repo_name = repo.get("name")
+              default_branch = repo.get("default_branch")
 
-              protection = get_branch_protection(repo_name, default_branch)
-              rulesets = get_rulesets(repo_name)
+              log(f"[{idx}/{len(repos)}] Checking repo: {repo_name} (default: {default_branch})")
+              rules_data = get_effective_rules(repo_name, default_branch)
 
-              has_active_ruleset = False
-              ruleset_findings = []
-
-              for rs in rulesets:
-                  if rs.get("enforcement") == "active":
-                      conditions = rs.get("conditions", {})
-                      branch_conditions = conditions.get("ref_name", {}).get("include", [])
-                      if any(default_branch in b or f"refs/heads/{default_branch}" in b for b in branch_conditions):
-                          has_active_ruleset = True
-                          rule_types = [r.get("type") for r in rs.get("rules", [])]
-                          ruleset_findings.append({
-                              "name": rs["name"],
-                              "rules": rule_types
-                          })
-
-              if not protection and not has_active_ruleset:
-                  missing_configs.append({
+              if rules_data is None:
+                  # Could be 404 (no rules) or an error we logged
+                  dbg(f"No rules data returned for {repo_name}/{default_branch}")
+                  missing.append({
                       "repo": repo_name,
                       "missing": ["No active branch protection or ruleset found for default branch"]
                   })
                   continue
 
-              missing = []
+              rules = rules_data.get("rules", [])
+              dbg(f"Raw rule objects count: {len(rules)}")
+              if DEBUG:
+                  # Print compact summary of rules with type and any key parameters we care about
+                  for r in rules:
+                      rtype = r.get("type")
+                      params = r.get("parameters") or {}
+                      dbg(f"  Rule type={rtype} params={json.dumps(params, separators=(',',':'))}")
 
-              # --- Check Classic Branch Protection ---
-              if protection:
-                  reqs = protection.get("required_pull_request_reviews")
-                  if not reqs:
-                      missing.append("Require pull request before merging not enabled (classic)")
-                  elif reqs.get("required_approving_review_count", 0) < 2:
-                      missing.append(f"Required approving reviews = {reqs.get('required_approving_review_count', 0)} (expected 2)")
-                  if protection.get("allow_force_pushes", {}).get("enabled"):
-                      missing.append("Force pushes allowed")
-                  if protection.get("enforce_admins", {}).get("enabled") == False:
-                      missing.append("Admins can bypass protection")
+              rule_types = { r.get("type"): r for r in rules }
 
-              # --- Check Ruleset-based Protection ---
-              if has_active_ruleset:
-                  for rs in ruleset_findings:
-                      rule_types = rs["rules"]
-                      rule_summary = ", ".join(rule_types) if rule_types else "none"
-                      if "pull_request" not in rule_types:
-                          missing.append(f"Require pull request rule missing in ruleset '{rs['name']}'")
-                      if "required_approving_review_count" not in rule_types:
-                          missing.append(f"Required approving reviews rule missing in ruleset '{rs['name']}'")
-                      if "non_fast_forward" not in rule_types:
-                          missing.append(f"Non-fast-forward rule missing in ruleset '{rs['name']}'")
-                      if not missing:
-                          print(f"✅ {repo_name}: Ruleset '{rs['name']}' OK — Rules: {rule_summary}")
+              # Evaluate expected conditions
+              repo_missing = []
 
-              if missing:
-                  missing_configs.append({
-                      "repo": repo_name,
-                      "missing": missing
-                  })
+              # Require PRs
+              if "pull_request" not in rule_types:
+                  repo_missing.append("Require pull request before merging not enabled")
 
-          # --- Build Slack report ---
-          blocks = []
+              # Approvals count—some payloads include it in parameters
+              if "required_approving_review_count" not in rule_types:
+                  repo_missing.append("Required approving reviews rule missing")
+              else:
+                  params = rule_types["required_approving_review_count"].get("parameters") or {}
+                  count = params.get("required_approving_review_count") or params.get("count")  # some shapes use 'count'
+                  if count is None:
+                      repo_missing.append("Approvals rule present but count not specified (expected 2)")
+                  elif int(count) < 2:
+                      repo_missing.append(f"Required approving reviews = {count} (expected 2)")
 
-          if missing_configs:
+              # Merge safety (non-fast-forward)
+              if "non_fast_forward" not in rule_types:
+                  repo_missing.append("Non-fast-forward (merge protection) rule missing")
+
+              if repo_missing:
+                  log(f"{repo_name}: ❌ Issues found → {', '.join(repo_missing)}")
+                  missing.append({"repo": repo_name, "missing": repo_missing})
+              else:
+                  log(f"{repo_name}: ✅ Compliant")
+                  ok.append(repo_name)
+
+          # --- Slack report ---
+          summary = f"{len(ok)} repos compliant, {len(missing)} with issues"
+          log("Audit complete. " + summary)
+
+          blocks = [{
+              "type": "section",
+              "text": {"type": "mrkdwn", "text": f"*Branch Protection Audit Summary*\n{summary}"}
+          }]
+
+          if missing:
               blocks.append({
                   "type": "header",
                   "text": {"type": "plain_text", "text": "❌ Missing / Misconfigured Protections"}
               })
-              for m in missing_configs:
+              for m in missing:
                   details = "\n".join([f"• {i}" for i in m["missing"]])
                   blocks.append({
                       "type": "section",
                       "text": {"type": "mrkdwn", "text": f"*Repository:* `{m['repo']}`\n{details}"}
                   })
                   blocks.append({"type": "divider"})
-
-          if mismatched:
+          else:
               blocks.append({
-                  "type": "header",
-                  "text": {"type": "plain_text", "text": "⚠️ Mismatched Branch Protections"}
-              })
-              for mm in mismatched:
-                  blocks.append({
-                      "type": "section",
-                      "text": {"type": "mrkdwn", "text": f"*Repository:* `{mm['repo']}`\nProtected `{mm['protected']}` but default branch is `{mm['default']}`"}
-                  })
-                  blocks.append({"type": "divider"})
-
-          if not blocks:
-              blocks = [{
                   "type": "section",
-                  "text": {"type": "mrkdwn", "text": "✅ All repositories are compliant (classic or ruleset)."}
-              }]
+                  "text": {"type": "mrkdwn", "text": "✅ All repositories are fully compliant."}
+              })
 
-          requests.post(SLACK_WEBHOOK, json={"blocks": blocks})
+          try:
+              resp = requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=30)
+              log(f"Slack POST status: {resp.status_code}")
+              if resp.status_code >= 300:
+                  log(f"Slack response: {resp.text[:500]}", prefix="[WARN]")
+          except Exception as e:
+              log(f"Failed to send Slack message: {e}", prefix="[WARN]")
+
           EOF
