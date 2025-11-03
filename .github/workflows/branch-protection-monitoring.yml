@@ -1,0 +1,133 @@
+name: Branch Protection Audit
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'  # Every Monday at 3 AM UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      metadata: read
+      administration: read
+
+    env:
+      ORG_NAME: devops-saddam             # ✅ replace or set via org/environment variable
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Branch Protection Audit
+        run: |
+          import os, requests, json
+
+          ORG = os.getenv("ORG_NAME")
+          GH_TOKEN = os.getenv("GITHUB_TOKEN")
+          SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
+
+          headers = {
+              "Authorization": f"Bearer {GH_TOKEN}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          def get_repos():
+              repos = []
+              page = 1
+              while True:
+                  resp = requests.get(
+                      f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}",
+                      headers=headers
+                  )
+                  if resp.status_code != 200:
+                      break
+                  data = resp.json()
+                  if not data:
+                      break
+                  repos.extend(data)
+                  page += 1
+              return repos
+
+          def get_branch_protection(repo, branch):
+              url = f"https://api.github.com/repos/{ORG}/{repo}/branches/{branch}/protection"
+              resp = requests.get(url, headers=headers)
+              return resp.json() if resp.status_code == 200 else None
+
+          repos = get_repos()
+          missing_configs, mismatched = [], []
+
+          for repo in repos:
+              repo_name = repo["name"]
+              default_branch = repo["default_branch"]
+
+              # Get all branches
+              branches_resp = requests.get(
+                  f"https://api.github.com/repos/{ORG}/{repo_name}/branches",
+                  headers=headers
+              )
+              branches = branches_resp.json() if branches_resp.status_code == 200 else []
+
+              protection = get_branch_protection(repo_name, default_branch)
+
+              # Check for mismatched protection rules
+              for br in branches:
+                  if br["name"] != default_branch:
+                      other_protection = get_branch_protection(repo_name, br["name"])
+                      if other_protection:
+                          mismatched.append({
+                              "repo": repo_name,
+                              "default": default_branch,
+                              "protected": br["name"]
+                          })
+
+              if not protection:
+                  missing_configs.append({
+                      "repo": repo_name,
+                      "missing": ["Branch protection rule not found"]
+                  })
+                  continue
+
+              missing = []
+              reqs = protection.get("required_pull_request_reviews")
+              allow_bypass = protection.get("allow_force_pushes", {}).get("enabled", False)
+
+              if not reqs:
+                  missing.append("Require pull request before merging not enabled")
+              elif reqs.get("required_approving_review_count", 0) < 2:
+                  missing.append("Required approving reviews < 2")
+
+              if protection.get("allow_force_pushes", {}).get("enabled"):
+                  missing.append("Force pushes allowed")
+
+              if protection.get("enforce_admins", {}).get("enabled") == False:
+                  missing.append("Admins can bypass protection")
+
+              if missing:
+                  missing_configs.append({
+                      "repo": repo_name,
+                      "missing": missing
+                  })
+
+          msg = []
+          if missing_configs:
+              msg.append("*❌ Missing or Incorrect Configurations:*")
+              for m in missing_configs:
+                  msg.append(f"• `{m['repo']}` — {', '.join(m['missing'])}")
+          if mismatched:
+              msg.append("\n*⚠️ Mismatched Branch Protections:*")
+              for mm in mismatched:
+                  msg.append(f"• `{mm['repo']}` — Protected `{mm['protected']}` but default is `{mm['default']}`")
+
+          if not msg:
+              msg = ["✅ All repositories are compliant."]
+
+          requests.post(SLACK_WEBHOOK, json={"text": "\n".join(msg)})
