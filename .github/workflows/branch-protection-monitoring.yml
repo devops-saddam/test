@@ -1,8 +1,8 @@
 name: Branch Protection Audit
 
 on:
-  workflow_dispatch:
-  push:
+  workflow_dispatch:        # Manual trigger
+  push:                     # Optional: for testing
     branches:
       - main
 
@@ -15,7 +15,7 @@ jobs:
     env:
       ORG_NAME: devops-saddam
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}   # <-- Use your new PAT with ruleset read access
 
     steps:
       - name: Setup Python
@@ -65,7 +65,11 @@ jobs:
           def get_rulesets(repo):
               url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
               resp = requests.get(url, headers=headers)
-              return resp.json() if resp.status_code == 200 else []
+              if resp.status_code == 200:
+                  return resp.json()
+              elif resp.status_code == 403:
+                  print(f"⚠️ Access denied to rulesets for {repo}. Check token permissions.")
+              return []
 
           repos = get_repos()
           missing_configs, mismatched = [], []
@@ -84,13 +88,12 @@ jobs:
                   if rs.get("enforcement") == "active":
                       conditions = rs.get("conditions", {})
                       branch_conditions = conditions.get("ref_name", {}).get("include", [])
-                      # match refs/heads/main or main
-                      if any(default_branch in b for b in branch_conditions):
+                      if any(default_branch in b or f"refs/heads/{default_branch}" in b for b in branch_conditions):
                           has_active_ruleset = True
-                          rules = [r.get("type") for r in rs.get("rules", [])]
+                          rule_types = [r.get("type") for r in rs.get("rules", [])]
                           ruleset_findings.append({
                               "name": rs["name"],
-                              "rules": rules
+                              "rules": rule_types
                           })
 
               if not protection and not has_active_ruleset:
@@ -102,7 +105,7 @@ jobs:
 
               missing = []
 
-              # Check legacy branch protection if exists
+              # --- Check Classic Branch Protection ---
               if protection:
                   reqs = protection.get("required_pull_request_reviews")
                   if not reqs:
@@ -114,16 +117,19 @@ jobs:
                   if protection.get("enforce_admins", {}).get("enabled") == False:
                       missing.append("Admins can bypass protection")
 
-              # Check ruleset coverage
-              elif has_active_ruleset:
+              # --- Check Ruleset-based Protection ---
+              if has_active_ruleset:
                   for rs in ruleset_findings:
                       rule_types = rs["rules"]
+                      rule_summary = ", ".join(rule_types) if rule_types else "none"
                       if "pull_request" not in rule_types:
-                          missing.append("Require pull request before merging not enabled (ruleset)")
+                          missing.append(f"Require pull request rule missing in ruleset '{rs['name']}'")
                       if "required_approving_review_count" not in rule_types:
-                          missing.append("Required approving reviews rule missing")
+                          missing.append(f"Required approving reviews rule missing in ruleset '{rs['name']}'")
                       if "non_fast_forward" not in rule_types:
-                          missing.append("Non-fast-forward (merge enforcement) rule missing")
+                          missing.append(f"Non-fast-forward rule missing in ruleset '{rs['name']}'")
+                      if not missing:
+                          print(f"✅ {repo_name}: Ruleset '{rs['name']}' OK — Rules: {rule_summary}")
 
               if missing:
                   missing_configs.append({
@@ -131,7 +137,7 @@ jobs:
                       "missing": missing
                   })
 
-          # Build Slack report
+          # --- Build Slack report ---
           blocks = []
 
           if missing_configs:
@@ -140,10 +146,10 @@ jobs:
                   "text": {"type": "plain_text", "text": "❌ Missing / Misconfigured Protections"}
               })
               for m in missing_configs:
-                  detail = "\n".join([f"• {i}" for i in m["missing"]])
+                  details = "\n".join([f"• {i}" for i in m["missing"]])
                   blocks.append({
                       "type": "section",
-                      "text": {"type": "mrkdwn", "text": f"*Repository:* `{m['repo']}`\n{detail}"}
+                      "text": {"type": "mrkdwn", "text": f"*Repository:* `{m['repo']}`\n{details}"}
                   })
                   blocks.append({"type": "divider"})
 
