@@ -6,7 +6,6 @@ on:
     branches:
       - main               # or your preferred branch
   
-
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -90,16 +89,34 @@ jobs:
 
               rules = get_rules(name, branch)
               if not rules:
-                  log(f"{name}: ❌ No branch protection or ruleset found")
-                  missing.append({"repo": name, "issues": ["No branch protection or ruleset found"]})
+                  log(f"{name}: ❌ No branch protection rule or ruleset configured")
+                  missing.append({
+                      "repo": name,
+                      "issues": ["No branch protection rule or ruleset configured"],
+                      "source": "no protection"
+                  })
                   continue
+
+              dbg(f"Raw rule count: {len(rules)}")
+              for r in rules:
+                  dbg(f"  Rule type={r.get('type')} parameters={r.get('parameters')}")
+
+              # Detect protection source type
+              rule_source = "classic"
+              if any(r.get("source") == "RepositoryRuleset" for r in rules):
+                  rule_source = "ruleset"
+                  name_field = rules[0].get("name")
+                  if name_field:
+                      rule_source = f"ruleset '{name_field}'"
 
               rule_types = {r.get("type"): r for r in rules}
               issues = []
 
+              # 1. Require PR before merge
               if "pull_request" not in rule_types:
                   issues.append("Require pull request before merging not enabled")
 
+              # 2. Required approvals count
               if "required_approving_review_count" not in rule_types:
                   issues.append("Required approving reviews rule missing")
               else:
@@ -110,20 +127,23 @@ jobs:
                   elif int(count) < 2:
                       issues.append(f"Approvals required = {count}, expected 2")
 
+              # 3. Dismiss stale reviews
               if "dismiss_stale_reviews" not in rule_types:
                   issues.append("Dismiss stale pull request approvals not enabled")
 
+              # 4. Restrict deletions
               if "restrict_deletions" not in rule_types:
                   issues.append("Restrict deletions rule not enabled")
 
+              # 5. Block force pushes
               if "non_fast_forward" not in rule_types:
                   issues.append("Block force pushes rule not enabled")
 
               if issues:
-                  log(f"{name}: ❌ Misconfigured → {', '.join(issues)}")
-                  missing.append({"repo": name, "issues": issues})
+                  log(f"{name}: ❌ Issues ({rule_source}) → {', '.join(issues)}")
+                  missing.append({"repo": name, "issues": issues, "source": rule_source})
               else:
-                  log(f"{name}: ✅ All required rules in place")
+                  log(f"{name}: ✅ All required rules in place ({rule_source})")
                   ok.append(name)
 
           # --- Summary ---
@@ -134,12 +154,18 @@ jobs:
           if missing:
               log("\nRepositories with issues:")
               for m in missing:
-                  log(f"- {m['repo']}: {', '.join(m['issues'])}")
+                  log(f"- {m['repo']} ({m['source']}): {', '.join(m['issues'])}")
           log("=================================")
 
           # --- Slack Notification ---
           if SLACK:
-              summary = f"*Branch Protection Audit Summary*\nTotal repositories: {len(repos)}\n✅ Compliant: {len(ok)}\n❌ With Issues: {len(missing)}"
+              summary = (
+                  f"*Branch Protection Audit Summary*\n"
+                  f"Total repositories: {len(repos)}\n"
+                  f"✅ Compliant: {len(ok)}\n"
+                  f"❌ With Issues: {len(missing)}"
+              )
+
               blocks = [
                   {"type": "section", "text": {"type": "mrkdwn", "text": summary}}
               ]
@@ -151,10 +177,21 @@ jobs:
                       "text": {"type": "plain_text", "text": "Repositories with Issues"}
                   })
                   for m in missing:
+                      repo_name = m["repo"]
+                      source = m.get("source", "unknown protection")
+                      if source == "no protection":
+                          heading = f"*{repo_name}*\nNo branch protection rule or ruleset configured"
+                      elif "ruleset" in source:
+                          heading = f"*{repo_name}*\nFound {source} applied"
+                      elif source == "classic":
+                          heading = f"*{repo_name}*\nFound classic branch protection rule"
+                      else:
+                          heading = f"*{repo_name}*\n{source}"
+
                       issues = "\n".join([f"• {i}" for i in m["issues"]])
                       blocks.append({
                           "type": "section",
-                          "text": {"type": "mrkdwn", "text": f"*{m['repo']}*\n{issues}"}
+                          "text": {"type": "mrkdwn", "text": f"{heading}\n{issues}"}
                       })
                       blocks.append({"type": "divider"})
               else:
