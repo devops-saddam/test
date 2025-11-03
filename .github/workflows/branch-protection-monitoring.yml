@@ -1,4 +1,4 @@
-name: Branch Protection Detailed Audit
+name: Branch Protection Detailed Audit (Rules API)
 
 on:
   workflow_dispatch:
@@ -24,10 +24,10 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Detailed Branch Protection Audit
+      - name: Run Unified Branch Protection Audit
         run: |
           python - <<'EOF'
-          import os, requests, json, sys
+          import os, requests, json
 
           ORG = os.getenv("ORG_NAME")
           TOKEN = os.getenv("GITHUB_TOKEN")
@@ -35,7 +35,6 @@ jobs:
 
           def log(msg, lvl="INFO"):
               print(f"[{lvl}] {msg}", flush=True)
-
           def dbg(msg):
               if DEBUG: log(msg, "DEBUG")
 
@@ -46,9 +45,11 @@ jobs:
 
           def get_json(url):
               r = requests.get(url, headers=headers, timeout=30)
+              dbg(f"GET {url} → {r.status_code}")
               if r.status_code == 200:
                   return r.json()
               elif r.status_code == 404:
+                  dbg(f"{url} → 404 Not Found")
                   return None
               else:
                   log(f"Failed GET {url} → {r.status_code}: {r.text[:300]}", "WARN")
@@ -65,91 +66,71 @@ jobs:
                   page += 1
               return repos
 
-          def check_branch_protection(repo, branch):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/branches/{branch}/protection"
+          def get_rules(repo, branch):
+              url = f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}"
               return get_json(url)
 
-          def get_rulesets(repo):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
-              return get_json(url) or []
-
-          # --- START ---
+          # --- Start ---
           repos = get_repos()
           log(f"Total repositories found: {len(repos)}")
-          for r in repos:
-              log(f"→ {r['name']}")
+          for r in repos: log(f"→ {r['name']}")
 
           missing, ok = [], []
 
           for idx, repo in enumerate(repos, start=1):
               name = repo["name"]
-              default_branch = repo["default_branch"]
+              branch = repo["default_branch"]
               log(f"\n[{idx}/{len(repos)}] Checking repository: {name}")
-              log(f"Default branch for {name} is '{default_branch}'")
+              log(f"Default branch for {name} is '{branch}'")
 
-              # --- Check for Classic Branch Protection ---
-              protection = check_branch_protection(name, default_branch)
-              if protection:
-                  log(f"Branch protection rule FOUND for {name}")
-                  issues = []
-
-                  pr_req = protection.get("required_pull_request_reviews")
-                  if not pr_req:
-                      issues.append("Require pull request before merging not enabled")
-                  else:
-                      count = pr_req.get("required_approving_review_count", 0)
-                      if count < 2:
-                          issues.append(f"Approvals set to {count}, expected 2")
-                      if not pr_req.get("dismiss_stale_reviews", False):
-                          issues.append("Dismiss stale pull request approvals not enabled")
-
-                  if issues:
-                      log(f"{name}: ❌ Misconfigured → {', '.join(issues)}")
-                      missing.append({"repo": name, "issues": issues})
-                  else:
-                      log(f"{name}: ✅ Classic branch protection compliant")
-                      ok.append(name)
+              rules = get_rules(name, branch)
+              if not rules:
+                  log(f"{name}: ❌ No branch protection or ruleset found")
+                  missing.append({"repo": name, "issues": ["No branch protection or ruleset found"]})
                   continue
 
-              log(f"No classic branch protection found for {name}, checking Rulesets...")
+              dbg(f"Raw rule count: {len(rules)}")
+              for r in rules:
+                  dbg(f"  Rule type={r.get('type')} parameters={r.get('parameters')}")
 
-              # --- Check Rulesets if no branch protection ---
-              rulesets = get_rulesets(name)
-              if not rulesets:
-                  log(f"{name}: ❌ No rulesets found → No protection")
-                  missing.append({"repo": name, "issues": ["No branch protection or ruleset configured"]})
-                  continue
-
+              rule_types = {r.get("type"): r for r in rules}
               issues = []
-              found_active = False
-              for rs in rulesets:
-                  if rs.get("enforcement") != "active":
-                      continue
-                  found_active = True
-                  log(f"Active Ruleset found: {rs['name']}")
-                  rules = [r.get("type") for r in rs.get("rules", [])]
-                  dbg(f"Rules in {rs['name']}: {rules}")
 
-                  if "restrict_deletions" not in rules:
-                      issues.append("Restrict deletions not enabled")
-                  if "pull_request" not in rules:
-                      issues.append("Require pull request rule missing")
-                  if "required_approving_review_count" not in rules:
-                      issues.append("Required approving reviews rule missing or not set to 2")
-                  if "non_fast_forward" not in rules:
-                      issues.append("Block force pushes not enabled")
+              # 1. Require PR before merge
+              if "pull_request" not in rule_types:
+                  issues.append("Require pull request before merging not enabled")
 
-              if not found_active:
-                  issues.append("No active rulesets found")
+              # 2. Required approvals count
+              if "required_approving_review_count" not in rule_types:
+                  issues.append("Required approving reviews rule missing")
+              else:
+                  params = rule_types["required_approving_review_count"].get("parameters") or {}
+                  count = params.get("required_approving_review_count") or params.get("count")
+                  if not count:
+                      issues.append("Approvals rule present but count missing")
+                  elif int(count) < 2:
+                      issues.append(f"Approvals required = {count}, expected 2")
+
+              # 3. Dismiss stale reviews
+              if "dismiss_stale_reviews" not in rule_types:
+                  issues.append("Dismiss stale pull request approvals not enabled")
+
+              # 4. Restrict deletions
+              if "restrict_deletions" not in rule_types:
+                  issues.append("Restrict deletions rule not enabled")
+
+              # 5. Block force pushes
+              if "non_fast_forward" not in rule_types:
+                  issues.append("Block force pushes rule not enabled")
 
               if issues:
                   log(f"{name}: ❌ Misconfigured → {', '.join(issues)}")
                   missing.append({"repo": name, "issues": issues})
               else:
-                  log(f"{name}: ✅ Ruleset-based protection compliant")
+                  log(f"{name}: ✅ All required rules in place")
                   ok.append(name)
 
-          # --- SUMMARY ---
+          # --- Summary ---
           log("\n========= AUDIT SUMMARY =========")
           log(f"Total repositories: {len(repos)}")
           log(f"Compliant: {len(ok)}")
@@ -159,5 +140,4 @@ jobs:
               for m in missing:
                   log(f"- {m['repo']}: {', '.join(m['issues'])}")
           log("=================================")
-
           EOF
