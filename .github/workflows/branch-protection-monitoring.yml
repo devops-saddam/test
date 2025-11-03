@@ -53,21 +53,6 @@ jobs:
               log(f"Failed GET {url} -> {r.status_code}: {r.text[:150]}", "WARN")
               return None
 
-          def graphql(query: str, variables: dict):
-              url = "https://api.github.com/graphql"
-              headers = {**H, "Content-Type": "application/json"}
-              payload = {"query": query, "variables": variables}
-              r = requests.post(url, json=payload, headers=headers, timeout=30)
-              dbg(f"POST /graphql -> {r.status_code}")
-              if r.status_code != 200:
-                  log(f"GraphQL error {r.status_code}: {r.text[:200]}", "WARN")
-                  return None
-              data = r.json()
-              if "errors" in data:
-                  log(f"GraphQL errors: {data['errors']}", "WARN")
-                  return None
-              return data.get("data")
-
           def list_repos():
               repos, page = [], 1
               while True:
@@ -80,35 +65,6 @@ jobs:
 
           def get_rules(repo, branch):
               return get_json(f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}") or []
-
-          def get_classic_branch_patterns(repo):
-              # Use GraphQL to fetch classic branch protection rule patterns without enumerating branches
-              q = """
-              query($owner:String!, $name:String!) {
-                repository(owner:$owner, name:$name) {
-                  branchProtectionRules(first: 50) {
-                    nodes {
-                      pattern
-                      requiresApprovingReviews
-                      requiredApprovingReviewCount
-                      dismissesStaleReviews
-                      requiresStatusChecks
-                      requiresCodeOwnerReviews
-                      allowsDeletions
-                      allowsForcePushes
-                    }
-                  }
-                }
-              }
-              """
-              data = graphql(q, {"owner": ORG, "name": repo})
-              patterns = []
-              if not data or not data.get("repository"):
-                  return patterns
-              nodes = (data["repository"].get("branchProtectionRules") or {}).get("nodes") or []
-              for n in nodes:
-                  patterns.append(n)
-              return patterns
 
           # ---- Start
           repos = list_repos()
@@ -129,55 +85,13 @@ jobs:
               rules = get_rules(name, default_branch)
               
               if not rules:
-                  # No protection found on default branch — see if classic protection exists targeting another pattern
-                  classic_rules = get_classic_branch_patterns(name)
-                  if classic_rules:
-                      patterns = [r.get("pattern") for r in classic_rules if r.get("pattern")]
-                      if patterns and default_branch not in patterns:
-                          log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {', '.join(patterns)}")
-                          missing.append({
-                              "repo": name,
-                              "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {', '.join(patterns)}"],
-                              "source": "mismatch"
-                          })
-                          continue
-                      # Classic rule exists for default branch but not shown by Rules API (edge). Validate with GraphQL fields.
-                      issues = []
-                      for n in classic_rules:
-                          if n.get("pattern") == default_branch:
-                              if not n.get("requiresApprovingReviews"):
-                                  issues.append("Require pull request before merging not enabled")
-                              else:
-                                  cnt = n.get("requiredApprovingReviewCount") or 0
-                                  if int(cnt) != 2:
-                                      issues.append(f"Required approvals = {cnt}, expected 2")
-                              if not n.get("dismissesStaleReviews"):
-                                  issues.append("Dismiss stale pull request approvals when new commits are pushed not enabled")
-                              if not n.get("requiresStatusChecks"):
-                                  issues.append("Require status checks to pass before merging not enabled")
-                              # Optional checks
-                              if n.get("allowsForcePushes"):
-                                  issues.append("Block force pushes rule not enabled")
-                              if n.get("allowsDeletions"):
-                                  issues.append("Restrict deletions rule not enabled")
-                              break
-                      if issues:
-                          log(f"{name}: ❌ Issues (classic branch protection) → {', '.join(issues)}")
-                          missing.append({"repo": name, "issues": issues, "source": "classic"})
-                      else:
-                          log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
-                          missing.append({
-                              "repo": name,
-                              "issues": [f"No branch protection rule or ruleset configured on default branch '{default_branch}'"],
-                              "source": "no protection"
-                          })
-                  else:
-                      log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
-                      missing.append({
-                          "repo": name,
-                          "issues": [f"No branch protection rule or ruleset configured on default branch '{default_branch}'"],
-                          "source": "no protection"
-                      })
+                  # No protection found on default branch using Rules API
+                  log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
+                  missing.append({
+                      "repo": name,
+                      "issues": [f"No branch protection rule or ruleset configured on default branch '{default_branch}'"],
+                      "source": "no protection"
+                  })
                   continue
 
               # Rules found on default branch - determine if classic or ruleset
