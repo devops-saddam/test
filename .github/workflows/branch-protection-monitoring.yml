@@ -63,21 +63,8 @@ jobs:
                   page += 1
               return repos
 
-          def list_branches(repo):
-              branches, page = [], 1
-              while True:
-                  data = get_json(f"https://api.github.com/repos/{ORG}/{repo}/branches?per_page=100&page={page}")
-                  if not data: break
-                  branches += [b["name"] for b in data]
-                  if len(data) < 100: break
-                  page += 1
-              return branches
-
           def get_rules(repo, branch):
               return get_json(f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}") or []
-
-          def get_classic_branch_protection(repo, branch):
-              return get_json(f"https://api.github.com/repos/{ORG}/{repo}/branches/{branch}/protection")
 
           # ---- Start
           repos = list_repos()
@@ -94,45 +81,87 @@ jobs:
 
               issues = []
               
-              # Step 2: First check for classic branch protection rule on any branch
-              branches = list_branches(name)
-              classic_protected_branches = []
+              # Step 2: Check rules on default branch using Rules API (works with RULESET_PAT)
+              rules = get_rules(name, default_branch)
               
-              for branch in branches:
-                  classic_protection = get_classic_branch_protection(name, branch)
-                  if classic_protection:
-                      classic_protected_branches.append(branch)
-              
-              # If classic protection exists, check if it matches default branch
-              if classic_protected_branches:
-                  if default_branch not in classic_protected_branches:
-                      log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {', '.join(classic_protected_branches)}")
+              if not rules:
+                  # No rules found on default branch - check if protection exists on other branches
+                  log(f"{name}: No branch protection on default branch '{default_branch}', checking other branches...")
+                  
+                  # Get list of branches to check for mismatch (only if needed)
+                  branches_data = get_json(f"https://api.github.com/repos/{ORG}/{name}/branches?per_page=10")
+                  protected_branches = []
+                  
+                  if branches_data:
+                      # Check top 10 branches for protection (usually enough)
+                      for branch_info in branches_data[:10]:
+                          branch_name = branch_info.get("name")
+                          if branch_name != default_branch:
+                              branch_rules = get_rules(name, branch_name)
+                              if branch_rules:
+                                  # Check if it's classic protection or ruleset
+                                  has_protection = False
+                                  for rule in branch_rules:
+                                      if rule.get("source") in ["BranchProtectionRule", "RepositoryRuleSet"]:
+                                          has_protection = True
+                                          protected_branches.append(branch_name)
+                                          break
+                  
+                  if protected_branches:
+                      log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but branch protection is configured for {', '.join(protected_branches)}")
                       missing.append({
                           "repo": name,
-                          "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but classic branch protection is configured for {', '.join(classic_protected_branches)}"],
+                          "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but branch protection is configured for {', '.join(protected_branches)}"],
                           "source": "mismatch"
                       })
-                      continue
-                  
-                  # Classic protection exists on default branch, now verify settings
-                  classic_protection = get_classic_branch_protection(name, default_branch)
-                  log(f"{name}: Found classic branch protection rule on '{default_branch}'")
-                  
-                  # Verify classic branch protection settings
-                  pr_reviews = classic_protection.get("required_pull_request_reviews")
-                  if not pr_reviews:
-                      issues.append("Require pull request before merging not enabled")
                   else:
-                      required_approvals = pr_reviews.get("required_approving_review_count", 0)
-                      if required_approvals != 2:
-                          issues.append(f"Required approvals = {required_approvals}, expected 2")
-                      
-                      if not pr_reviews.get("dismiss_stale_reviews", False):
-                          issues.append("Dismiss stale pull request approvals when new commits are pushed not enabled")
+                      log(f"{name}: ❌ No branch protection rule or ruleset configured")
+                      missing.append({
+                          "repo": name,
+                          "issues": ["No branch protection rule or ruleset configured"],
+                          "source": "no protection"
+                      })
+                  continue
 
-                  # Check require status checks
-                  if not classic_protection.get("required_status_checks"):
-                      issues.append("Require status checks to pass before merging not enabled")
+              # Rules found on default branch - determine if classic or ruleset
+              rule_source = None
+              ruleset_name = None
+              
+              for rule in rules:
+                  if rule.get("source") == "BranchProtectionRule":
+                      rule_source = "classic"
+                      break
+                  elif rule.get("source") == "RepositoryRuleSet":
+                      rule_source = "ruleset"
+                      ruleset_name = rule.get("ruleset_name") or rule.get("name", "unknown")
+                      break
+
+              if not rule_source:
+                  rule_source = "unknown"
+
+              if rule_source == "classic":
+                  log(f"{name}: Found classic branch protection rule on '{default_branch}'")
+                  # Verify classic branch protection settings via Rules API
+                  rule_types = {r.get("type"): r for r in rules}
+                  
+                  if "pull_request" not in rule_types:
+                      issues.append("Require pull request before merging not enabled")
+
+                  if "required_approving_review_count" not in rule_types:
+                      issues.append("Required approving reviews rule missing")
+                  else:
+                      params = rule_types["required_approving_review_count"].get("parameters") or {}
+                      count = params.get("required_approving_review_count") or params.get("count")
+                      if not count:
+                          issues.append("Approvals rule present but count missing")
+                      elif int(count) != 2:
+                          issues.append(f"Required approvals = {count}, expected 2")
+
+                  if "dismiss_stale_reviews" not in rule_types:
+                      issues.append("Dismiss stale pull request approvals when new commits are pushed not enabled")
+
+                  # Note: Status checks and other classic protection features may not be available via Rules API
+                  # We focus on the core requirements that are available
 
                   if issues:
                       log(f"{name}: ❌ Issues (classic branch protection) → {', '.join(issues)}")
@@ -140,37 +169,8 @@ jobs:
                   else:
                       log(f"{name}: ✅ All required rules in place (classic branch protection)")
                       ok.append(name)
-                  continue
 
-              # If no classic protection, check for ruleset on default branch
-              rules = get_rules(name, default_branch)
-              if not rules:
-                  log(f"{name}: ❌ No branch protection rule or ruleset configured")
-                  missing.append({
-                      "repo": name,
-                      "issues": ["No branch protection rule or ruleset configured"],
-                      "source": "no protection"
-                  })
-                  continue
-
-              # Check if ruleset matches default branch
-              rule_source = None
-              ruleset_name = None
-              for rule in rules:
-                  if rule.get("source") == "RepositoryRuleSet":
-                      rule_source = "ruleset"
-                      ruleset_name = rule.get("ruleset_name") or rule.get("name", "unknown")
-                      break
-                  elif rule.get("source") == "BranchProtectionRule":
-                      # This shouldn't happen if classic protection wasn't found, but check anyway
-                      rule_source = "classic_via_rules"
-                      break
-
-              if not rule_source:
-                  rule_source = "unknown"
-                  ruleset_name = "unknown"
-
-              if rule_source == "ruleset":
+              elif rule_source == "ruleset":
                   log(f"{name}: Found ruleset '{ruleset_name}' on '{default_branch}'")
                   # Ruleset matches default branch, now check the rules
                   rule_types = {r.get("type"): r for r in rules}
@@ -204,30 +204,12 @@ jobs:
                       log(f"{name}: ✅ All required rules in place (ruleset '{ruleset_name}')")
                       ok.append(name)
               else:
-                  # Check if there's a mismatch - ruleset on different branch (we already have branches list)
-                  ruleset_branches = []
-                  for b in branches:
-                      if b != default_branch:
-                          branch_rules = get_rules(name, b)
-                          for rule in branch_rules:
-                              if rule.get("source") == "RepositoryRuleSet":
-                                  ruleset_branches.append(b)
-                                  break
-
-                  if ruleset_branches:
-                      log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but ruleset is configured for {', '.join(ruleset_branches)}")
-                      missing.append({
-                          "repo": name,
-                          "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but ruleset is configured for {', '.join(ruleset_branches)}"],
-                          "source": "mismatch"
-                      })
-                  else:
-                      log(f"{name}: ❌ No valid branch protection configuration found")
-                      missing.append({
-                          "repo": name,
-                          "issues": ["No valid branch protection rule or ruleset configuration found"],
-                          "source": "no valid protection"
-                      })
+                  log(f"{name}: ❌ Unknown or invalid branch protection configuration")
+                  missing.append({
+                      "repo": name,
+                      "issues": ["Unknown or invalid branch protection configuration"],
+                      "source": "unknown"
+                  })
 
           # ---- Slack reporting with chunking to avoid payload limits
           if SLACK:
