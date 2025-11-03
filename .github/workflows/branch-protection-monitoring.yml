@@ -1,9 +1,12 @@
 name: Branch Protection Audit
 
 on:
-  schedule:
-    - cron: '0 3 * * 1'  # Every Monday at 3 AM UTC
-  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 3 * * 1'  # Runs every Monday at 3 AM UTC
+  workflow_dispatch:      # ✅ Manual trigger from GitHub UI
+  push:                   # ✅ Trigger on any push to test behavior
+    branches:
+      - main               # or your preferred branch
 
 jobs:
   audit:
