@@ -1,12 +1,10 @@
 name: Branch Protection Audit
 
 on:
-  # schedule:
-  #   - cron: '0 3 * * 1'  # Runs every Monday at 3 AM UTC
-  workflow_dispatch:      # ✅ Manual trigger from GitHub UI
-  push:                   # ✅ Trigger on any push to test behavior
+  workflow_dispatch:
+  push:
     branches:
-      - main               # or your preferred branch
+      - main
 
 jobs:
   audit:
@@ -28,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Branch Protection Audit
+      - name: Run Branch Protection + Ruleset Audit
         run: |
           python - <<'EOF'
           import os, requests, json
@@ -64,6 +62,11 @@ jobs:
               resp = requests.get(url, headers=headers)
               return resp.json() if resp.status_code == 200 else None
 
+          def get_rulesets(repo):
+              url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
+              resp = requests.get(url, headers=headers)
+              return resp.json() if resp.status_code == 200 else []
+
           repos = get_repos()
           missing_configs, mismatched = [], []
 
@@ -71,46 +74,56 @@ jobs:
               repo_name = repo["name"]
               default_branch = repo["default_branch"]
 
-              branches_resp = requests.get(
-                  f"https://api.github.com/repos/{ORG}/{repo_name}/branches",
-                  headers=headers
-              )
-              branches = branches_resp.json() if branches_resp.status_code == 200 else []
-
               protection = get_branch_protection(repo_name, default_branch)
+              rulesets = get_rulesets(repo_name)
 
-              # Check for mismatched branch protection
-              for br in branches:
-                  if br["name"] != default_branch:
-                      other_protection = get_branch_protection(repo_name, br["name"])
-                      if other_protection:
-                          mismatched.append({
-                              "repo": repo_name,
-                              "default": default_branch,
-                              "protected": br["name"]
+              has_active_ruleset = False
+              ruleset_findings = []
+
+              for rs in rulesets:
+                  if rs.get("enforcement") == "active":
+                      conditions = rs.get("conditions", {})
+                      branch_conditions = conditions.get("ref_name", {}).get("include", [])
+                      # match refs/heads/main or main
+                      if any(default_branch in b for b in branch_conditions):
+                          has_active_ruleset = True
+                          rules = [r.get("type") for r in rs.get("rules", [])]
+                          ruleset_findings.append({
+                              "name": rs["name"],
+                              "rules": rules
                           })
 
-              # Validate protection on default branch
-              if not protection:
+              if not protection and not has_active_ruleset:
                   missing_configs.append({
                       "repo": repo_name,
-                      "missing": ["Branch protection rule not found on default branch"]
+                      "missing": ["No active branch protection or ruleset found for default branch"]
                   })
                   continue
 
               missing = []
-              reqs = protection.get("required_pull_request_reviews")
 
-              if not reqs:
-                  missing.append("Require pull request before merging not enabled")
-              elif reqs.get("required_approving_review_count", 0) < 2:
-                  missing.append(f"Required approving reviews is {reqs.get('required_approving_review_count', 0)} (expected 2)")
+              # Check legacy branch protection if exists
+              if protection:
+                  reqs = protection.get("required_pull_request_reviews")
+                  if not reqs:
+                      missing.append("Require pull request before merging not enabled (classic)")
+                  elif reqs.get("required_approving_review_count", 0) < 2:
+                      missing.append(f"Required approving reviews = {reqs.get('required_approving_review_count', 0)} (expected 2)")
+                  if protection.get("allow_force_pushes", {}).get("enabled"):
+                      missing.append("Force pushes allowed")
+                  if protection.get("enforce_admins", {}).get("enabled") == False:
+                      missing.append("Admins can bypass protection")
 
-              if protection.get("allow_force_pushes", {}).get("enabled"):
-                  missing.append("Force pushes are allowed")
-
-              if protection.get("enforce_admins", {}).get("enabled") == False:
-                  missing.append("Admins can bypass protection")
+              # Check ruleset coverage
+              elif has_active_ruleset:
+                  for rs in ruleset_findings:
+                      rule_types = rs["rules"]
+                      if "pull_request" not in rule_types:
+                          missing.append("Require pull request before merging not enabled (ruleset)")
+                      if "required_approving_review_count" not in rule_types:
+                          missing.append("Required approving reviews rule missing")
+                      if "non_fast_forward" not in rule_types:
+                          missing.append("Non-fast-forward (merge enforcement) rule missing")
 
               if missing:
                   missing_configs.append({
@@ -118,22 +131,19 @@ jobs:
                       "missing": missing
                   })
 
-          # --- Build Slack message payload ---
+          # Build Slack report
           blocks = []
 
           if missing_configs:
               blocks.append({
                   "type": "header",
-                  "text": {"type": "plain_text", "text": "❌ Missing / Misconfigured Branch Protections"}
+                  "text": {"type": "plain_text", "text": "❌ Missing / Misconfigured Protections"}
               })
               for m in missing_configs:
-                  detail_text = "\n".join([f"• {i}" for i in m["missing"]])
+                  detail = "\n".join([f"• {i}" for i in m["missing"]])
                   blocks.append({
                       "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": f"*Repository:* `{m['repo']}`\n{detail_text}"
-                      }
+                      "text": {"type": "mrkdwn", "text": f"*Repository:* `{m['repo']}`\n{detail}"}
                   })
                   blocks.append({"type": "divider"})
 
@@ -145,19 +155,15 @@ jobs:
               for mm in mismatched:
                   blocks.append({
                       "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": f"*Repository:* `{mm['repo']}`\nProtection applied to `{mm['protected']}` but default branch is `{mm['default']}`"
-                      }
+                      "text": {"type": "mrkdwn", "text": f"*Repository:* `{mm['repo']}`\nProtected `{mm['protected']}` but default branch is `{mm['default']}`"}
                   })
                   blocks.append({"type": "divider"})
 
           if not blocks:
               blocks = [{
                   "type": "section",
-                  "text": {"type": "mrkdwn", "text": "✅ All repositories are fully compliant."}
+                  "text": {"type": "mrkdwn", "text": "✅ All repositories are compliant (classic or ruleset)."}
               }]
 
-          payload = {"blocks": blocks}
-          requests.post(SLACK_WEBHOOK, json=payload)
+          requests.post(SLACK_WEBHOOK, json={"blocks": blocks})
           EOF
