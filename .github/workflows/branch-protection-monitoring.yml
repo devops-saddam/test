@@ -16,7 +16,7 @@ jobs:
     env:
       ORG_NAME: ${{ github.repository_owner }}
       GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}
-      SLACK_WEBHOOK: ${{ secrets.EDEVOPS_SLACK_WEBHOOK_URL }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
       DEBUG: "true"
       PYTHONUNBUFFERED: "1"
 
@@ -81,46 +81,17 @@ jobs:
 
               issues = []
               
-              # Step 2: Check rules on default branch using Rules API (works with RULESET_PAT)
+              # Step 2: Check rules on default branch directly using Rules API (works with RULESET_PAT)
               rules = get_rules(name, default_branch)
               
               if not rules:
-                  # No rules found on default branch - check if protection exists on other branches
-                  log(f"{name}: No branch protection on default branch '{default_branch}', checking other branches...")
-                  
-                  # Get list of branches to check for mismatch (only if needed)
-                  branches_data = get_json(f"https://api.github.com/repos/{ORG}/{name}/branches?per_page=10")
-                  protected_branches = []
-                  
-                  if branches_data:
-                      # Check top 10 branches for protection (usually enough)
-                      for branch_info in branches_data[:10]:
-                          branch_name = branch_info.get("name")
-                          if branch_name != default_branch:
-                              branch_rules = get_rules(name, branch_name)
-                              if branch_rules:
-                                  # Check if it's classic protection or ruleset
-                                  has_protection = False
-                                  for rule in branch_rules:
-                                      if rule.get("source") in ["BranchProtectionRule", "RepositoryRuleSet"]:
-                                          has_protection = True
-                                          protected_branches.append(branch_name)
-                                          break
-                  
-                  if protected_branches:
-                      log(f"{name}: ⚠️ Misconfigured branch protection found: Default branch is '{default_branch}' but branch protection is configured for {', '.join(protected_branches)}")
-                      missing.append({
-                          "repo": name,
-                          "issues": [f"Misconfigured branch protection found: Default branch is '{default_branch}' but branch protection is configured for {', '.join(protected_branches)}"],
-                          "source": "mismatch"
-                      })
-                  else:
-                      log(f"{name}: ❌ No branch protection rule or ruleset configured")
-                      missing.append({
-                          "repo": name,
-                          "issues": ["No branch protection rule or ruleset configured"],
-                          "source": "no protection"
-                      })
+                  # No protection found on default branch
+                  log(f"{name}: ❌ No branch protection rule or ruleset configured on default branch '{default_branch}'")
+                  missing.append({
+                      "repo": name,
+                      "issues": [f"No branch protection rule or ruleset configured on default branch '{default_branch}'"],
+                      "source": "no protection"
+                  })
                   continue
 
               # Rules found on default branch - determine if classic or ruleset
