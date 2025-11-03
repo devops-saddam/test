@@ -31,54 +31,52 @@ jobs:
       - name: Run Unified Branch Protection Audit
         run: |
           python - <<'EOF'
-          import os, requests, json
+          import os, requests
 
           ORG = os.getenv("ORG_NAME")
           TOKEN = os.getenv("GITHUB_TOKEN")
           SLACK = os.getenv("SLACK_WEBHOOK")
-          DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+          DEBUG = os.getenv("DEBUG","false").lower()=="true"
 
-          def log(msg, lvl="INFO"): print(f"[{lvl}] {msg}", flush=True)
-          def dbg(msg): 
-              if DEBUG: log(msg, "DEBUG")
+          def log(m,l="INFO"): print(f"[{l}] {m}", flush=True)
+          def dbg(m): 
+              if DEBUG: log(m,"DEBUG")
 
-          headers = {
-              "Authorization": f"Bearer {TOKEN}",
-              "Accept": "application/vnd.github+json"
-          }
+          H = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
 
           def get_json(url):
-              r = requests.get(url, headers=headers, timeout=30)
-              dbg(f"GET {url} → {r.status_code}")
-              if r.status_code == 200:
-                  return r.json()
-              elif r.status_code == 404:
-                  return None
-              else:
-                  log(f"Failed GET {url} → {r.status_code}: {r.text[:200]}", "WARN")
-                  return None
+              r = requests.get(url, headers=H, timeout=30)
+              dbg(f"GET {url} -> {r.status_code}")
+              if r.status_code==200: return r.json()
+              if r.status_code==404: return None
+              log(f"Failed GET {url} -> {r.status_code}: {r.text[:150]}", "WARN")
+              return None
 
-          def get_repos():
+          def list_repos():
               repos, page = [], 1
               while True:
-                  url = f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}"
-                  data = get_json(url)
+                  data = get_json(f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}")
                   if not data: break
-                  repos.extend(data)
+                  repos += data
                   if len(data) < 100: break
                   page += 1
               return repos
 
-          def get_branch_rules(repo, branch):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}"
-              return get_json(url)
+          def list_branches(repo):
+              branches, page = [], 1
+              while True:
+                  data = get_json(f"https://api.github.com/repos/{ORG}/{repo}/branches?per_page=100&page={page}")
+                  if not data: break
+                  branches += [b["name"] for b in data]
+                  if len(data) < 100: break
+                  page += 1
+              return branches
 
-          def get_rulesets(repo):
-              url = f"https://api.github.com/repos/{ORG}/{repo}/rulesets"
-              return get_json(url) or []
+          def get_rules(repo, branch):
+              return get_json(f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}") or []
 
-          # --- Start ---
-          repos = get_repos()
+          # ---- Start
+          repos = list_repos()
           log(f"Total repositories found: {len(repos)}")
           for r in repos: log(f"→ {r['name']}")
 
@@ -90,14 +88,32 @@ jobs:
               log(f"\n[{idx}/{len(repos)}] Checking repository: {name}")
               log(f"Default branch for {name} is '{default_branch}'")
 
-              # 1️⃣  Get branch-specific rules
-              branch_rules = get_branch_rules(name, default_branch)
-              # 2️⃣  Also fetch all rulesets for mismatch detection
-              rulesets = get_rulesets(name)
-              dbg(f"Total rulesets found for {name}: {len(rulesets)}")
+              branches = list_branches(name)
+              classic_protections = []
 
-              # --- Case: No rules found at all
-              if not branch_rules and not rulesets:
+              # Check for classic branch protection on any branch
+              for b in branches:
+                  rules = get_rules(name, b)
+                  if rules:
+                      for rule in rules:
+                          if rule.get("source") == "BranchProtectionRule":
+                              classic_protections.append(b)
+
+              if classic_protections:
+                  dbg(f"Classic protections detected: {classic_protections}")
+                  # If classic rule applies to a different branch
+                  if default_branch not in classic_protections:
+                      log(f"{name}: ⚠️ Mismatch — classic protection for {classic_protections} but default branch is '{default_branch}'")
+                      missing.append({
+                          "repo": name,
+                          "issues": [f"Misconfigured branch protection: Default branch is '{default_branch}' but classic branch protection is configured for {', '.join(classic_protections)}."],
+                          "source": "mismatch"
+                      })
+                      continue
+
+              # Proceed only if default branch has any rule
+              rules = get_rules(name, default_branch)
+              if not rules:
                   log(f"{name}: ❌ No branch protection rule or ruleset configured")
                   missing.append({
                       "repo": name,
@@ -106,48 +122,16 @@ jobs:
                   })
                   continue
 
-              # --- Detect branch protection mismatch
-              branch_patterns = []
-              for rs in rulesets:
-                  cond = rs.get("conditions", {})
-                  ref_name = cond.get("ref_name", {})
-                  includes = ref_name.get("include") or []
-                  for pattern in includes:
-                      branch_patterns.append(pattern)
-
-              dbg(f"Branch patterns detected: {branch_patterns}")
-              if branch_patterns and all(default_branch not in pat for pat in branch_patterns):
-                  log(f"{name}: ⚠️ Mismatch — protection applies to {branch_patterns} but default branch is '{default_branch}'")
-                  missing.append({
-                      "repo": name,
-                      "issues": [f"Misconfigured branch protection: Default branch is '{default_branch}' but protection applies to {', '.join(branch_patterns)}"],
-                      "source": "mismatch"
-                  })
-                  continue
-
-              # --- Evaluate actual rules for default branch
-              rules = branch_rules or []
-              if not rules:
-                  log(f"{name}: ❌ No branch protection rules found for default branch '{default_branch}'")
-                  missing.append({
-                      "repo": name,
-                      "issues": [f"No branch protection rules found for default branch '{default_branch}'"],
-                      "source": "no protection"
-                  })
-                  continue
-
-              rule_source = "classic"
-              if any(r.get("source") == "RepositoryRuleset" for r in rules):
-                  rule_source = "ruleset"
-                  name_field = rules[0].get("name")
-                  if name_field:
-                      rule_source = f"ruleset '{name_field}'"
+              rule_source = "classic" if any(r.get("source") == "BranchProtectionRule" for r in rules) else "ruleset"
+              if rule_source == "ruleset" and rules[0].get("name"):
+                  rule_source = f"ruleset '{rules[0].get('name')}'"
 
               rule_types = {r.get("type"): r for r in rules}
-              issues = []
+              issues=[]
 
               if "pull_request" not in rule_types:
                   issues.append("Require pull request before merging not enabled")
+
               if "required_approving_review_count" not in rule_types:
                   issues.append("Required approving reviews rule missing")
               else:
@@ -157,6 +141,7 @@ jobs:
                       issues.append("Approvals rule present but count missing")
                   elif int(count) < 2:
                       issues.append(f"Approvals required = {count}, expected 2")
+
               if "dismiss_stale_reviews" not in rule_types:
                   issues.append("Dismiss stale pull request approvals not enabled")
               if "restrict_deletions" not in rule_types:
@@ -171,7 +156,7 @@ jobs:
                   log(f"{name}: ✅ All required rules in place ({rule_source})")
                   ok.append(name)
 
-          # --- Slack Notification ---
+          # ---- Slack reporting
           if SLACK:
               summary = (
                   f"*Branch Protection Audit Summary*\n"
@@ -179,17 +164,14 @@ jobs:
                   f"✅ Compliant: {len(ok)}\n"
                   f"❌ With Issues: {len(missing)}"
               )
-              blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": summary}}]
+              blocks = [{"type":"section","text":{"type":"mrkdwn","text":summary}}]
 
               if missing:
-                  blocks.append({"type": "divider"})
-                  blocks.append({
-                      "type": "header",
-                      "text": {"type": "plain_text", "text": "Repositories with Issues"}
-                  })
+                  blocks.append({"type":"divider"})
+                  blocks.append({"type":"header","text":{"type":"plain_text","text":"Repositories with Issues"}})
                   for m in missing:
                       repo_name = m["repo"]
-                      source = m.get("source", "unknown protection")
+                      source = m.get("source","unknown")
                       if source == "no protection":
                           heading = f"*{repo_name}*\nNo branch protection rule or ruleset configured"
                       elif source == "mismatch":
@@ -200,22 +182,15 @@ jobs:
                           heading = f"*{repo_name}*\nFound classic branch protection rule"
                       else:
                           heading = f"*{repo_name}*\n{source}"
-
                       issues = "\n".join([f"• {i}" for i in m["issues"]])
-                      blocks.append({
-                          "type": "section",
-                          "text": {"type": "mrkdwn", "text": f"{heading}\n{issues}"}
-                      })
-                      blocks.append({"type": "divider"})
+                      blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"{heading}\n{issues}"}})
+                      blocks.append({"type":"divider"})
               else:
-                  blocks.append({
-                      "type": "section",
-                      "text": {"type": "mrkdwn", "text": "✅ All repositories are fully compliant."}
-                  })
+                  blocks.append({"type":"section","text":{"type":"mrkdwn","text":"✅ All repositories are fully compliant."}})
 
               try:
-                  resp = requests.post(SLACK, json={"blocks": blocks}, timeout=30)
-                  log(f"Slack POST → {resp.status_code}")
+                  r = requests.post(SLACK, json={"blocks": blocks}, timeout=30)
+                  log(f"Slack POST -> {r.status_code}")
               except Exception as e:
                   log(f"Slack POST failed: {e}", "WARN")
           else:
