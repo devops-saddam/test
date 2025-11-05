@@ -757,7 +757,23 @@ jobs:
                                   r2 = requests.post(SLACK, json=file_payload, timeout=30)
                                   log(f"Slack file link POST -> {r2.status_code}")
                               else:
-                                  log(f"Slack files.upload error: {result.get('error', 'unknown')}", "WARN")
+                                  err = result.get('error', 'unknown')
+                                  log(f"Slack files.upload error: {err}", "WARN")
+                                  # Fallback: files.upload may be deprecated for this token/app (method_deprecated).
+                                  # Post a shorter notification via the incoming webhook so Slack still receives a report
+                                  if err == 'method_deprecated' and SLACK:
+                                      try:
+                                          fallback_text = (
+                                              f"*Branch Protection Audit CSV upload skipped*\n"
+                                              f"The Slack API returned 'method_deprecated' for files.upload when using the bot token.\n"
+                                              f"Possible fixes: ensure your Slack app uses a Bot Token (xoxb-) with the `files:write` scope and reinstall the app.\n"
+                                              f"CSV saved as a workflow artifact: `branch-protection-report` (download from Actions run)."
+                                          )
+                                          fallback_block = {"type": "section", "text": {"type": "mrkdwn", "text": fallback_text}}
+                                          r3 = requests.post(SLACK, json={"text": "Branch Protection Audit - CSV upload skipped", "blocks": [fallback_block]}, timeout=30)
+                                          log(f"Slack fallback POST -> {r3.status_code}")
+                                      except Exception as e:
+                                          log(f"Slack fallback POST failed: {e}", "WARN")
                           else:
                               log(f"Slack files.upload HTTP error: {r.status_code} - {r.text[:200]}", "WARN")
                       except Exception as e:
