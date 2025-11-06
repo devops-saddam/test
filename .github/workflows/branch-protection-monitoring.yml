@@ -15,7 +15,7 @@ jobs:
     env:
       ORG_NAME: ${{ github.repository_owner }}
       GITHUB_TOKEN: ${{ secrets.RULESET_PAT }}
-      SLACK_WEBHOOK: ${{ secrets.DEVOPS_SLACK_WEBHOOK_URL }}
+      SLACK_WEBHOOK: ${{ secrets.EDEVOPS_SLACK_WEBHOOK_URL }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
       DEBUG: "true"
@@ -57,16 +57,15 @@ jobs:
           def list_repos():
               repos, page = [], 1
               while True:
-                  # Use visibility=all to include both public and private repositories
-                  # (ensure the token used has access to private repos if you need to check them)
-                  data = get_json(f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}&type=all&visibility=all")
+                  # Use visibility=private parameter to filter at API level
+                  data = get_json(f"https://api.github.com/orgs/{ORG}/repos?per_page=100&page={page}&type=all&visibility=private")
                   if not data: break
                   repos += data
                   if len(data) < 100: break
                   page += 1
               # Filter to exclude archived repositories
-              active_repos = [r for r in repos if not r.get("archived", False)]
-              return active_repos
+              active_private_repos = [r for r in repos if not r.get("archived", False)]
+              return active_private_repos
 
           def get_rules(repo, branch):
               return get_json(f"https://api.github.com/repos/{ORG}/{repo}/rules/branches/{branch}") or []
@@ -710,72 +709,96 @@ jobs:
                       f.write(csv_report)
                   log(f"CSV report saved to {report_file} ({len(csv_report)} bytes)")
                   
-                  # Send CSV file to Slack using files.upload API
+                  # Send CSV file to Slack using new files.getUploadURLExternal API
                   # Note: This requires a Slack bot token (not webhook URL)
+                  # Process: 1) getUploadURLExternal 2) upload file 3) completeUploadExternal
                   slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
                   slack_channel = os.getenv("SLACK_CHANNEL", "")  # Channel ID (e.g., C1234567890)
                   
                   if slack_bot_token:
                       csv_bytes = csv_report.encode("utf-8")
+                      file_size = len(csv_bytes)
+                      filename = "branch_protection_report.csv"
                       
-                      files_url = "https://slack.com/api/files.upload"
-                      files_headers = {"Authorization": f"Bearer {slack_bot_token}"}
-                      
-                      files_data = {
-                          "filename": "branch_protection_report.csv",
-                          "title": f"Branch Protection Audit Report - {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                          "initial_comment": f"Branch Protection Audit Report: {len(ok)} compliant, {len(missing)} with issues out of {len(repos)} total repositories",
-                      }
-                      
-                      # Add channel if provided (channel ID, not channel name)
-                      if slack_channel:
-                          files_data["channels"] = slack_channel
-                      
-                      files_files = {
-                          "file": ("branch_protection_report.csv", csv_bytes, "text/csv")
-                      }
+                      api_headers = {"Authorization": f"Bearer {slack_bot_token}", "Content-Type": "application/json"}
                       
                       try:
-                          # Use files.upload API
-                          r = requests.post(files_url, headers=files_headers, data=files_data, files=files_files, timeout=60)
-                          if r.status_code == 200:
-                              result = r.json()
-                              if result.get("ok"):
-                                  file_url = result.get("file", {}).get("permalink")
-                                  file_id = result.get("file", {}).get("id")
-                                  log(f"CSV file uploaded to Slack: {file_url}")
+                          # Step 1: Get upload URL and file ID
+                          get_url_data = {
+                              "filename": filename,
+                              "length": file_size
+                          }
+                          
+                          r1 = requests.post("https://slack.com/api/files.getUploadURLExternal", 
+                                            headers=api_headers, 
+                                            json=get_url_data, 
+                                            timeout=30)
+                          
+                          if r1.status_code == 200:
+                              result1 = r1.json()
+                              if result1.get("ok"):
+                                  upload_url = result1.get("upload_url")
+                                  file_id = result1.get("file_id")
                                   
-                                  # Post a message with the file link
-                                  file_link_block = {
-                                      "type": "section",
-                                      "text": {
-                                          "type": "mrkdwn",
-                                          "text": f"*CSV Report Available*\nDownload: <{file_url}|branch_protection_report.csv>"
-                                      }
-                                  }
-                                  file_payload = {"text": "CSV Report", "blocks": [file_link_block]}
-                                  r2 = requests.post(SLACK, json=file_payload, timeout=30)
-                                  log(f"Slack file link POST -> {r2.status_code}")
+                                  if upload_url and file_id:
+                                      # Step 2: Upload file to the provided URL
+                                      upload_headers = {"Content-Type": "text/csv"}
+                                      r2 = requests.put(upload_url, data=csv_bytes, headers=upload_headers, timeout=60)
+                                      
+                                      if r2.status_code in [200, 201]:
+                                          # Step 3: Complete the upload
+                                          complete_data = {
+                                              "files": [
+                                                  {
+                                                      "id": file_id,
+                                                      "title": f"Branch Protection Audit Report - {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                                                  }
+                                              ]
+                                          }
+                                          
+                                          # Add channel if provided
+                                          if slack_channel:
+                                              complete_data["channel_id"] = slack_channel
+                                          
+                                          r3 = requests.post("https://slack.com/api/files.completeUploadExternal",
+                                                            headers=api_headers,
+                                                            json=complete_data,
+                                                            timeout=30)
+                                          
+                                          if r3.status_code == 200:
+                                              result3 = r3.json()
+                                              if result3.get("ok"):
+                                                  files = result3.get("files", [])
+                                                  if files:
+                                                      file_info = files[0]
+                                                      file_url = file_info.get("permalink") or file_info.get("url_private")
+                                                      log(f"CSV file uploaded to Slack: {file_url}")
+                                                      
+                                                      # Post a message with the file link
+                                                      file_link_block = {
+                                                          "type": "section",
+                                                          "text": {
+                                                              "type": "mrkdwn",
+                                                              "text": f"*CSV Report Available*\nDownload: <{file_url}|branch_protection_report.csv>"
+                                                          }
+                                                      }
+                                                      file_payload = {"text": "CSV Report", "blocks": [file_link_block]}
+                                                      r4 = requests.post(SLACK, json=file_payload, timeout=30)
+                                                      log(f"Slack file link POST -> {r4.status_code}")
+                                                  else:
+                                                      log("Slack file upload completed but no file info returned", "WARN")
+                                              else:
+                                                  log(f"Slack files.completeUploadExternal error: {result3.get('error', 'unknown')}", "WARN")
+                                          else:
+                                              log(f"Slack files.completeUploadExternal HTTP error: {r3.status_code} - {r3.text[:200]}", "WARN")
+                                      else:
+                                          log(f"File upload to URL failed: {r2.status_code} - {r2.text[:200]}", "WARN")
+                                  else:
+                                      log(f"Missing upload_url or file_id in response: {result1}", "WARN")
                               else:
-                                  err = result.get('error', 'unknown')
-                                  log(f"Slack files.upload error: {err}", "WARN")
-                                  # Fallback: files.upload may be deprecated for this token/app (method_deprecated).
-                                  # Post a shorter notification via the incoming webhook so Slack still receives a report
-                                  if err == 'method_deprecated' and SLACK:
-                                      try:
-                                          fallback_text = (
-                                              f"*Branch Protection Audit CSV upload skipped*\n"
-                                              f"The Slack API returned 'method_deprecated' for files.upload when using the bot token.\n"
-                                              f"Possible fixes: ensure your Slack app uses a Bot Token (xoxb-) with the `files:write` scope and reinstall the app.\n"
-                                              f"CSV saved as a workflow artifact: `branch-protection-report` (download from Actions run)."
-                                          )
-                                          fallback_block = {"type": "section", "text": {"type": "mrkdwn", "text": fallback_text}}
-                                          r3 = requests.post(SLACK, json={"text": "Branch Protection Audit - CSV upload skipped", "blocks": [fallback_block]}, timeout=30)
-                                          log(f"Slack fallback POST -> {r3.status_code}")
-                                      except Exception as e:
-                                          log(f"Slack fallback POST failed: {e}", "WARN")
+                                  log(f"Slack files.getUploadURLExternal error: {result1.get('error', 'unknown')}", "WARN")
                           else:
-                              log(f"Slack files.upload HTTP error: {r.status_code} - {r.text[:200]}", "WARN")
+                              log(f"Slack files.getUploadURLExternal HTTP error: {r1.status_code} - {r1.text[:200]}", "WARN")
                       except Exception as e:
                           log(f"Slack file upload failed: {e}", "WARN")
                   else:
