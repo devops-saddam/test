@@ -727,17 +727,22 @@ jobs:
                       
                       try:
                           # Step 1: Get upload URL and file ID
+                          # Note: Slack API expects form-encoded data, not JSON
                           get_url_data = {
                               "filename": filename,
                               "length": file_size
                           }
                           
-                          dbg(f"Step 1: Calling files.getUploadURLExternal with payload: {get_url_data}")
-                          log(f"Step 1: Requesting upload URL from Slack API...")
+                          dbg(f"Step 1: Calling files.getUploadURLExternal with form data: {get_url_data}")
+                          log(f"Step 1: Requesting upload URL from Slack API (using form-encoded data)...")
+                          
+                          # Use form-encoded data (data=) instead of JSON
+                          # Remove Content-Type header to let requests set it automatically for form data
+                          form_headers = {"Authorization": f"Bearer {slack_bot_token}"}
                           
                           r1 = requests.post("https://slack.com/api/files.getUploadURLExternal", 
-                                            headers=api_headers, 
-                                            json=get_url_data, 
+                                            headers=form_headers, 
+                                            data=get_url_data, 
                                             timeout=30)
                           
                           dbg(f"Step 1: Response status={r1.status_code}, headers={dict(r1.headers)}")
@@ -842,9 +847,9 @@ jobs:
                                   log(f"Step 1: Slack files.getUploadURLExternal error: {error_msg}", "WARN")
                                   if error_detail:
                                       log(f"Step 1: Error details: {error_detail}", "WARN")
-                                  log(f"Step 1: Request payload was: filename='{filename}', length={file_size}", "WARN")
+                                  log(f"Step 1: Request form data was: filename='{filename}', length={file_size}", "WARN")
                                   dbg(f"Step 1: Full error response: {result1}")
-                                  dbg(f"Step 1: Request headers: {api_headers}")
+                                  dbg(f"Step 1: Request headers: {form_headers}")
                           else:
                               log(f"Step 1: HTTP error {r1.status_code}: {r1.text[:500]}", "WARN")
                               dbg(f"Step 1: Full response: {r1.text}")
