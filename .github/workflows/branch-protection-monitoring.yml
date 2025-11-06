@@ -720,6 +720,9 @@ jobs:
                       file_size = len(csv_bytes)
                       filename = "branch_protection_report.csv"
                       
+                      log(f"Starting Slack file upload: filename={filename}, size={file_size} bytes, channel={slack_channel or 'not specified'}")
+                      dbg(f"SLACK_BOT_TOKEN present: {bool(slack_bot_token)}, length={len(slack_bot_token) if slack_bot_token else 0}")
+                      
                       api_headers = {"Authorization": f"Bearer {slack_bot_token}", "Content-Type": "application/json"}
                       
                       try:
@@ -729,23 +732,42 @@ jobs:
                               "length": file_size
                           }
                           
+                          dbg(f"Step 1: Calling files.getUploadURLExternal with payload: {get_url_data}")
+                          log(f"Step 1: Requesting upload URL from Slack API...")
+                          
                           r1 = requests.post("https://slack.com/api/files.getUploadURLExternal", 
                                             headers=api_headers, 
                                             json=get_url_data, 
                                             timeout=30)
                           
+                          dbg(f"Step 1: Response status={r1.status_code}, headers={dict(r1.headers)}")
+                          
                           if r1.status_code == 200:
                               result1 = r1.json()
+                              dbg(f"Step 1: Full response: {result1}")
+                              
                               if result1.get("ok"):
                                   upload_url = result1.get("upload_url")
                                   file_id = result1.get("file_id")
                                   
+                                  log(f"Step 1: Success - upload_url={'present' if upload_url else 'missing'}, file_id={'present' if file_id else 'missing'}")
+                                  dbg(f"Step 1: upload_url={upload_url}, file_id={file_id}")
+                                  
                                   if upload_url and file_id:
                                       # Step 2: Upload file to the provided URL
                                       upload_headers = {"Content-Type": "text/csv"}
+                                      log(f"Step 2: Uploading file to provided URL...")
+                                      dbg(f"Step 2: PUT {upload_url[:100]}... (truncated), Content-Type=text/csv, size={file_size}")
+                                      
                                       r2 = requests.put(upload_url, data=csv_bytes, headers=upload_headers, timeout=60)
                                       
+                                      dbg(f"Step 2: Response status={r2.status_code}, headers={dict(r2.headers)}")
+                                      if r2.text:
+                                          dbg(f"Step 2: Response body: {r2.text[:500]}")
+                                      
                                       if r2.status_code in [200, 201]:
+                                          log(f"Step 2: File uploaded successfully")
+                                          
                                           # Step 3: Complete the upload
                                           complete_data = {
                                               "files": [
@@ -759,20 +781,29 @@ jobs:
                                           # Add channel if provided
                                           if slack_channel:
                                               complete_data["channel_id"] = slack_channel
+                                              log(f"Step 3: Completing upload with channel_id={slack_channel}")
+                                          else:
+                                              log(f"Step 3: Completing upload without channel (will be in user's files)")
+                                          
+                                          dbg(f"Step 3: Calling files.completeUploadExternal with payload: {complete_data}")
                                           
                                           r3 = requests.post("https://slack.com/api/files.completeUploadExternal",
                                                             headers=api_headers,
                                                             json=complete_data,
                                                             timeout=30)
                                           
+                                          dbg(f"Step 3: Response status={r3.status_code}")
+                                          
                                           if r3.status_code == 200:
                                               result3 = r3.json()
+                                              dbg(f"Step 3: Full response: {result3}")
+                                              
                                               if result3.get("ok"):
                                                   files = result3.get("files", [])
                                                   if files:
                                                       file_info = files[0]
                                                       file_url = file_info.get("permalink") or file_info.get("url_private")
-                                                      log(f"CSV file uploaded to Slack: {file_url}")
+                                                      log(f"Step 3: Upload completed successfully! File URL: {file_url}")
                                                       
                                                       # Post a message with the file link
                                                       file_link_block = {
@@ -786,21 +817,41 @@ jobs:
                                                       r4 = requests.post(SLACK, json=file_payload, timeout=30)
                                                       log(f"Slack file link POST -> {r4.status_code}")
                                                   else:
-                                                      log("Slack file upload completed but no file info returned", "WARN")
+                                                      log("Step 3: Upload completed but no file info in response", "WARN")
+                                                      dbg(f"Step 3: Response files array: {files}")
                                               else:
-                                                  log(f"Slack files.completeUploadExternal error: {result3.get('error', 'unknown')}", "WARN")
+                                                  error_msg = result3.get("error", "unknown")
+                                                  error_detail = result3.get("errors", {})
+                                                  log(f"Step 3: Slack files.completeUploadExternal error: {error_msg}", "WARN")
+                                                  if error_detail:
+                                                      log(f"Step 3: Error details: {error_detail}", "WARN")
+                                                  dbg(f"Step 3: Full error response: {result3}")
                                           else:
-                                              log(f"Slack files.completeUploadExternal HTTP error: {r3.status_code} - {r3.text[:200]}", "WARN")
+                                              log(f"Step 3: HTTP error {r3.status_code}: {r3.text[:500]}", "WARN")
+                                              dbg(f"Step 3: Full response: {r3.text}")
                                       else:
-                                          log(f"File upload to URL failed: {r2.status_code} - {r2.text[:200]}", "WARN")
+                                          log(f"Step 2: File upload failed with status {r2.status_code}: {r2.text[:500]}", "WARN")
+                                          dbg(f"Step 2: Full response: {r2.text}")
                                   else:
-                                      log(f"Missing upload_url or file_id in response: {result1}", "WARN")
+                                      log(f"Step 1: Missing required fields in response", "WARN")
+                                      log(f"Step 1: upload_url present: {bool(upload_url)}, file_id present: {bool(file_id)}", "WARN")
+                                      dbg(f"Step 1: Full response: {result1}")
                               else:
-                                  log(f"Slack files.getUploadURLExternal error: {result1.get('error', 'unknown')}", "WARN")
+                                  error_msg = result1.get("error", "unknown")
+                                  error_detail = result1.get("errors", {})
+                                  log(f"Step 1: Slack files.getUploadURLExternal error: {error_msg}", "WARN")
+                                  if error_detail:
+                                      log(f"Step 1: Error details: {error_detail}", "WARN")
+                                  log(f"Step 1: Request payload was: filename='{filename}', length={file_size}", "WARN")
+                                  dbg(f"Step 1: Full error response: {result1}")
+                                  dbg(f"Step 1: Request headers: {api_headers}")
                           else:
-                              log(f"Slack files.getUploadURLExternal HTTP error: {r1.status_code} - {r1.text[:200]}", "WARN")
+                              log(f"Step 1: HTTP error {r1.status_code}: {r1.text[:500]}", "WARN")
+                              dbg(f"Step 1: Full response: {r1.text}")
                       except Exception as e:
-                          log(f"Slack file upload failed: {e}", "WARN")
+                          log(f"Slack file upload exception: {type(e).__name__}: {str(e)}", "WARN")
+                          import traceback
+                          dbg(f"Exception traceback: {traceback.format_exc()}")
                   else:
                       log("SLACK_BOT_TOKEN not set - CSV file will only be available as artifact. To send CSV to Slack, set SLACK_BOT_TOKEN secret with 'files:write' scope.", "WARN")
                       # Post a note about CSV in the message
