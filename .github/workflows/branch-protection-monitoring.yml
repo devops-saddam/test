@@ -715,6 +715,12 @@ jobs:
                   slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
                   slack_channel = os.getenv("SLACK_CHANNEL", "")  # Channel ID (e.g., C1234567890)
                   
+                  # Try to extract channel from webhook URL if not provided
+                  if not slack_channel and SLACK:
+                      # Webhook URLs sometimes contain channel info, but usually not
+                      # For now, we'll require SLACK_CHANNEL to be set
+                      pass
+                  
                   if slack_bot_token:
                       csv_bytes = csv_report.encode("utf-8")
                       file_size = len(csv_bytes)
@@ -773,7 +779,8 @@ jobs:
                                       if r2.status_code in [200, 201]:
                                           log(f"Step 2: File uploaded successfully")
                                           
-                                          # Step 3: Complete the upload
+                                          # Step 3: Complete the upload and post to channel
+                                          # File will be posted directly to the channel if channel_id is provided
                                           complete_data = {
                                               "files": [
                                                   {
@@ -783,12 +790,14 @@ jobs:
                                               ]
                                           }
                                           
-                                          # Add channel if provided
+                                          # Add channel_id to post file directly to channel
                                           if slack_channel:
                                               complete_data["channel_id"] = slack_channel
-                                              log(f"Step 3: Completing upload with channel_id={slack_channel}")
+                                              # Add initial comment to the file
+                                              complete_data["initial_comment"] = f"Branch Protection Audit Report: {len(ok)} compliant, {len(missing)} with issues out of {len(repos)} total repositories"
+                                              log(f"Step 3: Completing upload and posting to channel {slack_channel}")
                                           else:
-                                              log(f"Step 3: Completing upload without channel (will be in user's files)")
+                                              log(f"Step 3: Warning - No channel_id provided. File will be uploaded but not posted to channel. Set SLACK_CHANNEL secret.", "WARN")
                                           
                                           dbg(f"Step 3: Calling files.completeUploadExternal with payload: {complete_data}")
                                           
@@ -808,19 +817,21 @@ jobs:
                                                   if files:
                                                       file_info = files[0]
                                                       file_url = file_info.get("permalink") or file_info.get("url_private")
-                                                      log(f"Step 3: Upload completed successfully! File URL: {file_url}")
-                                                      
-                                                      # Post a message with the file link
-                                                      file_link_block = {
-                                                          "type": "section",
-                                                          "text": {
-                                                              "type": "mrkdwn",
-                                                              "text": f"*CSV Report Available*\nDownload: <{file_url}|branch_protection_report.csv>"
+                                                      if slack_channel:
+                                                          log(f"Step 3: File posted successfully to channel {slack_channel}! File URL: {file_url}")
+                                                      else:
+                                                          log(f"Step 3: File uploaded successfully (not posted to channel). File URL: {file_url}")
+                                                          # Only post download link if file wasn't posted to channel
+                                                          file_link_block = {
+                                                              "type": "section",
+                                                              "text": {
+                                                                  "type": "mrkdwn",
+                                                                  "text": f"*CSV Report Available*\nDownload: <{file_url}|branch_protection_report.csv>"
+                                                              }
                                                           }
-                                                      }
-                                                      file_payload = {"text": "CSV Report", "blocks": [file_link_block]}
-                                                      r4 = requests.post(SLACK, json=file_payload, timeout=30)
-                                                      log(f"Slack file link POST -> {r4.status_code}")
+                                                          file_payload = {"text": "CSV Report", "blocks": [file_link_block]}
+                                                          r4 = requests.post(SLACK, json=file_payload, timeout=30)
+                                                          log(f"Slack file link POST -> {r4.status_code}")
                                                   else:
                                                       log("Step 3: Upload completed but no file info in response", "WARN")
                                                       dbg(f"Step 3: Response files array: {files}")
